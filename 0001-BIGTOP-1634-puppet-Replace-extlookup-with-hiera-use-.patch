@@ -1,0 +1,2200 @@
+From e06a1843965eef8e0dc9ac648e0056d55e7199a7 Mon Sep 17 00:00:00 2001
+From: Michael Weiser <m.weiser@science-computing.de>
+Date: Sat, 31 Jan 2015 01:07:36 +0100
+Subject: [PATCH] BIGTOP-1634 puppet: Replace extlookup with hiera, use
+ parametrised classes
+
+Update the puppet code to use self-contained, parametrised classes and proper
+scoping. Replace all extlookup calls by either explicit or automatic hiera
+parameter lookups. Implement HA/non-HA alternative via hiera lookup hierarchy.
+Replace append_each from bigtop_util by suffix from stdlib. Do file imports via
+puppet:/// scheme. Remove bigtop_util because remaining function get_settings
+is not needed any more.
+
+Add additional configuration options for zookeeper and yarn as well as a new
+class for journalnode configuration.
+---
+ bigtop-deploy/puppet/README.md                     |  67 ++--
+ bigtop-deploy/puppet/config/site.csv.example       |  28 --
+ bigtop-deploy/puppet/hiera.yaml                    |   7 +
+ bigtop-deploy/puppet/hieradata/bigtop/cluster.yaml | 123 +++++++
+ bigtop-deploy/puppet/hieradata/bigtop/ha.yaml      |   7 +
+ bigtop-deploy/puppet/hieradata/bigtop/noha.yaml    |   2 +
+ bigtop-deploy/puppet/hieradata/site.yaml           |  32 ++
+ bigtop-deploy/puppet/manifests/cluster.pp          | 352 ++++---------------
+ bigtop-deploy/puppet/manifests/site.pp             |  24 +-
+ .../lib/puppet/parser/functions/append_each.rb     |  22 --
+ .../lib/puppet/parser/functions/get_setting.rb     |  20 --
+ .../puppet/modules/bigtop_util/manifests/init.pp   |  17 -
+ .../puppet/modules/crunch/manifests/init.pp        |   2 +-
+ .../puppet/modules/giraph/manifests/init.pp        |   2 +-
+ .../puppet/modules/hadoop-flume/manifests/init.pp  |   2 +-
+ .../puppet/modules/hadoop-hbase/manifests/init.pp  |  14 +-
+ .../puppet/modules/hadoop-hive/manifests/init.pp   |   2 +-
+ .../puppet/modules/hadoop-oozie/manifests/init.pp  |   4 +-
+ .../puppet/modules/hadoop-pig/manifests/init.pp    |   2 +-
+ .../puppet/modules/hadoop-sqoop/manifests/init.pp  |   4 +-
+ .../modules/hadoop-zookeeper/manifests/init.pp     |   7 +-
+ .../modules/hadoop-zookeeper/templates/zoo.cfg     |   4 +-
+ .../puppet/modules/hadoop/manifests/init.pp        | 380 ++++++++++++---------
+ .../puppet/modules/hadoop/templates/hadoop-env.sh  |   2 +-
+ .../puppet/modules/hadoop/templates/hdfs-site.xml  |  51 ++-
+ .../puppet/modules/hadoop/templates/yarn-site.xml  |  81 +++++
+ .../puppet/modules/hcatalog/manifests/init.pp      |   4 +-
+ bigtop-deploy/puppet/modules/hue/manifests/init.pp |   2 +-
+ .../puppet/modules/kerberos/manifests/init.pp      |  23 +-
+ .../puppet/modules/mahout/manifests/init.pp        |   2 +-
+ .../puppet/modules/solr/manifests/init.pp          |   2 +-
+ .../puppet/modules/spark/manifests/init.pp         |   6 +-
+ .../puppet/modules/tachyon/manifests/init.pp       |  10 +-
+ 33 files changed, 692 insertions(+), 615 deletions(-)
+ delete mode 100644 bigtop-deploy/puppet/config/site.csv.example
+ create mode 100644 bigtop-deploy/puppet/hiera.yaml
+ create mode 100644 bigtop-deploy/puppet/hieradata/bigtop/cluster.yaml
+ create mode 100644 bigtop-deploy/puppet/hieradata/bigtop/ha.yaml
+ create mode 100644 bigtop-deploy/puppet/hieradata/bigtop/noha.yaml
+ create mode 100644 bigtop-deploy/puppet/hieradata/site.yaml
+ delete mode 100644 bigtop-deploy/puppet/modules/bigtop_util/lib/puppet/parser/functions/append_each.rb
+ delete mode 100644 bigtop-deploy/puppet/modules/bigtop_util/lib/puppet/parser/functions/get_setting.rb
+ delete mode 100644 bigtop-deploy/puppet/modules/bigtop_util/manifests/init.pp
+
+diff --git a/bigtop-deploy/puppet/README.md b/bigtop-deploy/puppet/README.md
+index b2a8b6a..edab477 100644
+--- a/bigtop-deploy/puppet/README.md
++++ b/bigtop-deploy/puppet/README.md
+@@ -53,47 +53,74 @@ As above, we defined a confdir (i.e. /etc/puppet/) which has a config/ directory
+ 
+ The heart of puppet is the manifests file.  This file ( manifests/init.pp ) 
+ 
+-expects configuration to live in CSV at $confdir/config/site.csv, which takes the form
++expects configuration to live in hiera as specified by $confdir/hiera.yaml. An example
++hiera.yaml as well as hiera configuration yaml files are provided with the bigtop classes. They
++basically take the form:
+ 
+ <pre>
+-key,value[,value2,value3]
++key: value
+ </pre>
+ 
+-An example is provided at config/site.csv.example.  These values are loaded using 
+-puppet's extlookup() mechanism.
++with syntactic variations for hashes and arrays. Please consult the excellent puppet and hiera
++documentation for details.
+ 
+-Any options not defined there will revert to a default value defined in 
+-manifests/cluster.pp, with the following exceptions (which are required):
++All configuration is done via such key value assignments in hierdata/site.yaml.  Any options
++not defined there will revert to a default value defined in hieradata/cluster.yaml, with the
++following exceptions (which are required):
++
++* bigtop::hadoop\_head\_node: must be set to the FQDN of the name node of your
++	cluster (which will also become its job tracker and gateway)
++
++* bigtop::bigtop\_yumrepo\_uri: uri of a repository containing packages for
++	hadoop as built by Bigtop.
+ 
+-* hadoop\_head\_node: must be set to the FQDN of the name node of your cluster (which will also
+-                    become its job tracker and gateway)
+-* bigtop\_yumrepo\_uri: uri of a repository containing packages for hadoop as built by Bigtop.
+- 
+ $confdir is the directory that puppet will look into for its configuration.  On most systems, 
+ this will be either /etc/puppet/ or /etc/puppetlabs/puppet/.  You may override this value by 
+ specifying --confdir=path/to/config/dir on the puppet command line.
+ 
++cluster.yaml also serves as an example what parameters can be set and how they usually interact
++between modules.
++
+ You can instruct the recipes to install ssh-keys for user hdfs to enable passwordless login
+ across the cluster. This is for test purposes only, so by default the option is turned off.
+-Refer to bigtop-deploy/puppet/config/site.csv.example for more details.
+ 
+-For other options that may be set here, look for calls to extlookup() in manifests/cluster.pp.
+-Note that if hadoop\_storage\_dirs is left unset, puppet will attempt to guess which directories 
+-to use.
++Files such as ssh-keys are imported from the master using the puppet:/// URL scheme. For this
++to work, fileserver has to be enabled on the puppet master, the files module enabled and access
++allowed in auth.conf. fileserver.conf should therefore contain e.g.:
++
++<pre>
++[files]
++  path /etc/puppet/files
++  allow *
++</pre>
++
++No changes are required to the default puppet 3 auth.conf.
++
++For other options that may be set here, look for class parameters in the modules'
++manifests/init.pp files. Any class parameter can be used as a hiera key if prefixed with the
++module and class namespace. Module hue's server class will look for its parameter rm_host as
++hue::server::rm_host in hiera.
++Note that if hadoop::hadoop\_storage\_dirs is left unset, puppet will attempt to guess which
++directories to use.
+ 
+ ## Usage
+ 
+ - Make sure that the bigtop-deploy directory is available on every node of your cluster, and then
+-- Make sure you've installed puppet's stdlib "puppet module install puppetlabs/stdlib".
++- Make sure you've installed puppet's stdlib "puppet module install puppetlabs/stdlib" version
++  4.0.0 or newer.
+ 
+ And run the following on those nodes:
+ 
+ <pre>
+-# mkdir /etc/puppet/config
+-# cat > /etc/puppet/config/site.csv &lt;&lt; EOF
+-# hadoop_head_node,hadoopmaster.example.com
+-# hadoop_storage_dirs,/data/1,/data/2
+-# bigtop_yumrepo_uri,http://mirror.example.com/path/to/mirror/
++# cp bigtop-deploy/puppet/hiera.yaml /etc/puppet
++# mkdir -p /etc/puppet/hieradata
++# rsync -a --delete bigtop-deploy/puppet/hieradata/bigtop/ /etc/puppet/hieradata/bigtop/
++# cat > /etc/puppet/hieradata/site.yaml &lt;&lt; EOF
++# bigtop::hadoop_head_node: "hadoopmaster.example.com"
++# hadoop::hadoop_storage_dirs:
++#   - "/data/1"
++#   - "/data/2"
++# bigtop::bigtop_yumrepo_uri: "http://mirror.example.com/path/to/mirror/"
+ # EOF
+ # puppet apply -d --modulepath="bigtop-deploy/puppet/modules:/etc/puppet/modules" bigtop-deploy/puppet/manifests/site.pp
+ </pre>
+diff --git a/bigtop-deploy/puppet/config/site.csv.example b/bigtop-deploy/puppet/config/site.csv.example
+deleted file mode 100644
+index 60c88eb..0000000
+--- a/bigtop-deploy/puppet/config/site.csv.example
++++ /dev/null
+@@ -1,28 +0,0 @@
+-### WARNING:
+-### actual site.csv file shouldn't contain lines starting with '#'
+-### It will cause the parse to choke.
+-### End of WARNING
+-### This file needs to be customized to reflect the configuration of your cluster
+-### Store it as $BIGTOP_DEPLOY_PATH/config/site.csv
+-### use --confdir=$BIGTOP_DEPLOY_PATH (see README for more info)
+-# FQDN of Namenode
+-hadoop_head_node,hadoopmaster.example.com
+-# FQDN of standby node (for HA)
+-#standby_head_node,standbyNN.example.com
+-# FQDN of gateway node (if separate from NN)
+-#standby_head_node,gateway.example.com
+-# Storage directories (will be created if doesn't exist)
+-hadoop_storage_dirs,/data/1,/data/2,/data/3,/data/4
+-bigtop_yumrepo_uri,http://mirror.example.com/path/to/mirror/
+-# A list of stack' components to be deployed can be specified via special
+-# "$components" list. If $components isn't set then everything in the stack will
+-# be installed as usual. Otherwise only a specified list will be set
+-# Possible elements:
+-# hadoop,yarn,hbase,tachyon,flume,solrcloud,spark,oozie,hcat,sqoop,httpfs,
+-# hue,mahout,giraph,crunch,pig,hive,zookeeper
+-# Example (to deploy only HDFS and YARN server and gateway parts)
+-#components,hadoop,yarn
+-# Test-only variable controls if user hdfs' sshkeys should be installed to allow
+-# for passwordless login across the cluster. Required by some integration tests
+-#testonly_hdfs_sshkeys=no
+-
+diff --git a/bigtop-deploy/puppet/hiera.yaml b/bigtop-deploy/puppet/hiera.yaml
+new file mode 100644
+index 0000000..b276006
+--- /dev/null
++++ b/bigtop-deploy/puppet/hiera.yaml
+@@ -0,0 +1,7 @@
++---
++:yaml:
++  :datadir: /etc/puppet/hieradata
++:hierarchy:
++  - site
++  - "bigtop/%{hadoop_hiera_ha_path}"
++  - bigtop/cluster
+diff --git a/bigtop-deploy/puppet/hieradata/bigtop/cluster.yaml b/bigtop-deploy/puppet/hieradata/bigtop/cluster.yaml
+new file mode 100644
+index 0000000..41c8e31
+--- /dev/null
++++ b/bigtop-deploy/puppet/hieradata/bigtop/cluster.yaml
+@@ -0,0 +1,123 @@
++---
++### This file implements defaults and some dependant parameter defaulting logic.
++### Every parameter can be overridden using the hiera lookup hierarchy. The enclosd
++### hiera.yaml provides for this by adding a site.yaml to the lookup where
++### site-specific overrides can be placed. Therefore this file should never need
++### changing by site admins.
++
++# FQDN of Namenode
++#bigtop::hadoop_head_node: "hadoopmaster.example.com"
++# FQDN of standby node (enables HA if set)
++#bigtop::hadoop_standby_head_node: "standbyNN.example.com"
++# FQDN of gateway node (if separate from NN)
++#bigtop::hadoop_gateway_node: "gateway.example.com"
++
++# A list of stack' components to be deployed can be specified via special
++# "$components" list. If $components isn't set then everything in the stack will
++# be installed as usual. Otherwise only a specified list will be set
++# Possible elements:
++# hadoop,yarn,hbase,tachyon,flume,solrcloud,spark,oozie,hcat,sqoop,httpfs,
++# hue,mahout,giraph,crunch,pig,hive,zookeeper
++# Example (to deploy only HDFS and YARN server and gateway parts)
++# This can be a comma-separated list or an array.
++#hadoop_cluster_node::cluster_components:
++#  - hadoop
++#  - yarn
++
++# Storage directories (will be created if doesn't exist)
++#hadoop::hadoop_storage_dirs:
++#  - /data/1
++#  - /data/2
++#  - /data/3
++#  - /data/4
++
++#bigtop::bigtop_yumrepo_uri: "http://mirror.example.com/path/to/mirror/"
++
++# Test-only variable controls if user hdfs' sshkeys should be installed to allow
++# for passwordless login across the cluster. Required by some integration tests
++#hadoop::common_hdfs::testonly_hdfs_sshkeys: "no"
++
++# Default
++#hadoop::common_hdfs::ha: "disabled"
++
++# Kerberos
++#hadoop::hadoop_security_authentication: "kerberos"
++#kerberos::site::domain: "do.main"
++#kerberos::site::realm: "DO.MAIN"
++#kerberos::site::kdc_server: "localhost"
++#kerberos::site::kdc_port: "88"
++#kerberos::site::admin_port: "749"
++#kerberos::site::keytab_export_dir: "/var/lib/bigtop_keytabs"
++
++hadoop::common_hdfs::hadoop_namenode_host: "%{hiera('bigtop::hadoop_head_node')}"
++# actually default but needed for hadoop_namenode_uri here
++hadoop::common_hdfs::hadoop_namenode_port: "8020"
++
++hadoop::common_yarn::hadoop_ps_host: "%{hiera('bigtop::hadoop_head_node')}"
++hadoop::common_yarn::hadoop_rm_host: "%{hiera('bigtop::hadoop_head_node')}"
++# actually default but needed for hue::server::rm_port here
++hadoop::common_yarn::hadoop_rm_port: "8032"
++hadoop::common_yarn::kerberos_realm: "%{hiera('kerberos::site::realm')}"
++
++hadoop::common_mapred_app::hadoop_hs_host: "%{hiera('bigtop::hadoop_head_node')}"
++hadoop::common_mapred_app::hadoop_jobtracker_host: "%{hiera('bigtop::hadoop_head_node')}"
++
++# actually default but needed for hue::server::webhdfs_url here
++hadoop::httpfs::hadoop_httpfs_port: "14000"
++
++bigtop::hadoop_zookeeper_port: "2181"
++hadoop::zk: "%{hiera('bigtop::hadoop_head_node')}:%{hiera('bigtop::hadoop_zookeeper_port')}"
++
++bigtop::hadoop_namenode_uri: "hdfs://%{hiera('hadoop::common_hdfs::hadoop_namenode_host')}:%{hiera('hadoop::common_hdfs::hadoop_namenode_port')}"
++hadoop-hbase::base_relative_rootdir: "/hbase"
++hadoop-hbase::common_config::rootdir: "%{hiera('bigtop::hadoop_namenode_uri')}%{hiera('hadoop-hbase::base_relative_rootdir')}"
++hadoop-hbase::common_config::zookeeper_quorum: "%{hiera('bigtop::hadoop_head_node')}"
++hadoop-hbase::common_config::kerberos_realm: "%{hiera('kerberos::site::realm')}"
++hadoop-hbase::client::thrift: true
++
++solr::server::root_url: "%{hiera('bigtop::hadoop_namenode_uri')}"
++solr::server::zk: "%{hiera('hadoop::zk')}"
++solr::server::kerberos_realm: "%{hiera('kerberos::site::realm')}"
++# Default but needed here to make sure, hue uses the same port
++solr::server::port: "1978"
++
++hadoop-oozie::server::kerberos_realm: "%{hiera('kerberos::site::realm')}"
++
++hcatalog::server::kerberos_realm: "%{hiera('kerberos::site::realm')}"
++hcatalog::webhcat::server::kerberos_realm: "%{hiera('kerberos::site::realm')}"
++
++spark::common::spark_master_host: "%{hiera('bigtop::hadoop_head_node')}"
++
++tachyon::common::master_host: "%{hiera('bigtop::hadoop_head_node')}"
++
++hadoop-zookeeper::server::myid: "0"
++hadoop-zookeeper::server::ensemble:
++  - ["%{hiera('bigtop::hadoop_head_node')}:2888:3888"]
++hadoop-zookeeper::server::kerberos_realm: "%{hiera('kerberos::site::realm')}"
++
++# those are only here because they were present as extlookup keys previously
++bigtop::hadoop_rm_http_port: "8088"
++bigtop::hadoop_rm_proxy_port: "8088"
++bigtop::hadoop_history_server_port: "19888"
++bigtop::sqoop_server_port: "<never defined correctly>"
++bigtop::hbase_thrift_port: "9090"
++bigtop::hadoop_oozie_port: "11000"
++
++hue::server::rm_host: "%{hiera('hadoop::common_yarn::hadoop_rm_host')}"
++hue::server::rm_port: "%{hiera('hadoop::common_yarn::hadoop_rm_port')}"
++hue::server::rm_url: "http://%{hiera('bigtop::hadoop_head_node')}:%{hiera('bigtop::hadoop_rm_http_port')}"
++hue::server::rm_proxy_url: "http://%{hiera('bigtop::hadoop_head_node')}:%{hiera('bigtop::hadoop_rm_proxy_port')}"
++hue::server::history_server_url: "http://%{hiera('bigtop::hadoop_head_node')}:%{hiera('bigtop::hadoop_history_server_port')}"
++# those use fqdn instead of hadoop_head_node because it's only ever activated
++# on the gatewaynode
++hue::server::webhdfs_url: "http://%{fqdn}:%{hiera('hadoop::httpfs::hadoop_httpfs_port')}/webhdfs/v1"
++hue::server::sqoop_url: "http://%{fqdn}:%{hiera('bigtop::sqoop_server_port')}/sqoop"
++hue::server::solr_url: "http://%{fqdn}:%{hiera('solr::server::port')}/solr/"
++hue::server::hbase_thrift_url: "%{fqdn}:%{hiera('bigtop::hbase_thrift_port')}"
++hue::server::oozie_url: "http://%{hiera('bigtop::hadoop_head_node')}:%{hiera('bigtop::hadoop_oozie_port')}/oozie"
++hue::server::default_fs: "%{hiera('bigtop::hadoop_namenode_uri')}"
++hue::server::kerberos_realm: "%{hiera('kerberos::site::realm')}"
++
++giraph::client::zookeeper_quorum: "%{hiera('bigtop::hadoop_head_node')}"
++
++hadoop-hive::client::hbase_zookeeper_quorum: "%{hiera('hadoop-hbase::common_config::zookeeper_quorum')}"
+diff --git a/bigtop-deploy/puppet/hieradata/bigtop/ha.yaml b/bigtop-deploy/puppet/hieradata/bigtop/ha.yaml
+new file mode 100644
+index 0000000..3654987
+--- /dev/null
++++ b/bigtop-deploy/puppet/hieradata/bigtop/ha.yaml
+@@ -0,0 +1,7 @@
++---
++hadoop::common_hdfs::ha: "manual"
++hadoop::common_hdfs::hadoop_namenode_host:
++  - "%{hiera('bigtop::hadoop_head_node')}"
++  - "%{hiera('bigtop::standby_head_node')}"
++hadoop::common_hdfs::hadoop_ha_nameservice_id: "ha-nn-uri"
++hadoop_cluster_node::hadoop_namenode_uri: "hdfs://%{hiera('hadoop_ha_nameservice_id')}:8020"
+diff --git a/bigtop-deploy/puppet/hieradata/bigtop/noha.yaml b/bigtop-deploy/puppet/hieradata/bigtop/noha.yaml
+new file mode 100644
+index 0000000..ac81412
+--- /dev/null
++++ b/bigtop-deploy/puppet/hieradata/bigtop/noha.yaml
+@@ -0,0 +1,2 @@
++---
++# all done via defaults
+diff --git a/bigtop-deploy/puppet/hieradata/site.yaml b/bigtop-deploy/puppet/hieradata/site.yaml
+new file mode 100644
+index 0000000..339e2ab
+--- /dev/null
++++ b/bigtop-deploy/puppet/hieradata/site.yaml
+@@ -0,0 +1,32 @@
++---
++bigtop::hadoop_head_node: "head.node.fqdn"
++#bigtop::standby_head_node: "standby.head.node.fqdn"
++
++hadoop::hadoop_storage_dirs:
++  - /data/1
++  - /data/2
++  - /data/3
++  - /data/4
++
++#hadoop_cluster_node::cluster_components:
++#  - crunch
++#  - flume
++#  - giraph
++#  - hbase
++#  - hcat
++#  - hive
++#  - httpfs
++#  - hue
++#  - mahout
++#  - mapred-app
++#  - oozie
++#  - pig
++#  - solrcloud
++#  - spark
++#  - sqoop
++#  - tachyon
++#  - yarn
++#  - zookeeper
++
++# Debian:
++#bigtop::jdk_package_name: "openjdk-7-jre-headless"
+diff --git a/bigtop-deploy/puppet/manifests/cluster.pp b/bigtop-deploy/puppet/manifests/cluster.pp
+index 903f3e8..d4bae8a 100644
+--- a/bigtop-deploy/puppet/manifests/cluster.pp
++++ b/bigtop-deploy/puppet/manifests/cluster.pp
+@@ -13,131 +13,37 @@
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
+ 
+-class hadoop_cluster_node {
+-  require bigtop_util  
+-
+-  $hadoop_head_node        = extlookup("hadoop_head_node") 
+-  $standby_head_node = extlookup("standby_head_node", "")
+-  $hadoop_gateway_node     = extlookup("hadoop_gateway_node", $hadoop_head_node)
+-
+-  $hadoop_ha = $standby_head_node ? {
+-    ""      => disabled,
+-    default => extlookup("hadoop_ha", "manual"),
+-  }
+-
+-
+-  $hadoop_namenode_host        = $hadoop_ha ? {
+-    "disabled" => $hadoop_head_node,
+-    default    => [ $hadoop_head_node, $standby_head_node ],
+-  }
+-  $hadoop_namenode_port        = extlookup("hadoop_namenode_port", "8020")
+-  $hadoop_dfs_namenode_plugins = extlookup("hadoop_dfs_namenode_plugins", "")
+-  $hadoop_dfs_datanode_plugins = extlookup("hadoop_dfs_datanode_plugins", "")
+-  # $hadoop_dfs_namenode_plugins="org.apache.hadoop.thriftfs.NamenodePlugin"
+-  # $hadoop_dfs_datanode_plugins="org.apache.hadoop.thriftfs.DatanodePlugin"
+-  $hadoop_ha_nameservice_id    = extlookup("hadoop_ha_nameservice_id", "ha-nn-uri")
+-  $hadoop_namenode_uri   = $hadoop_ha ? {
+-    "disabled" => "hdfs://$hadoop_namenode_host:$hadoop_namenode_port",
+-    default    => "hdfs://${hadoop_ha_nameservice_id}:8020",
+-  }
+-
+-  $hadoop_rm_host        = $hadoop_head_node
+-  $hadoop_rt_port        = extlookup("hadoop_rt_port", "8025")
+-  $hadoop_rm_port        = extlookup("hadoop_rm_port", "8032")
+-  $hadoop_sc_port        = extlookup("hadoop_sc_port", "8030")
+-
+-  $hadoop_hs_host        = $hadoop_head_node
+-  $hadoop_hs_port        = extlookup("hadoop_hs_port", "10020")
+-  $hadoop_hs_webapp_port = extlookup("hadoop_hs_webapp_port", "19888")
+-
+-  $hadoop_ps_host        = $hadoop_head_node
+-  $hadoop_ps_port        = extlookup("hadoop_ps_port", "20888")
+-
+-  $hadoop_jobtracker_host            = $hadoop_head_node
+-  $hadoop_jobtracker_port            = extlookup("hadoop_jobtracker_port", "8021")
+-  $hadoop_mapred_jobtracker_plugins  = extlookup("hadoop_mapred_jobtracker_plugins", "")
+-  $hadoop_mapred_tasktracker_plugins = extlookup("hadoop_mapred_tasktracker_plugins", "")
+-
+-  $hadoop_zookeeper_port             = extlookup("hadoop_zookeeper_port", "2181")
+-  $solrcloud_port                    = extlookup("solrcloud_port", "1978")
+-  $solrcloud_admin_port              = extlookup("solrcloud_admin_port", "1979")
+-  $hadoop_oozie_port                 = extlookup("hadoop_oozie_port", "11000")
+-  $hadoop_httpfs_port                = extlookup("hadoop_httpfs_port", "14000")
+-  $hadoop_rm_http_port               = extlookup("hadoop_rm_http_port", "8088")
+-  $hadoop_rm_proxy_port              = extlookup("hadoop_rm_proxy_port", "8088")
+-  $hadoop_history_server_port        = extlookup("hadoop_history_server_port", "19888")
+-  $hbase_thrift_port                 = extlookup("hbase_thrift_port", "9090")
+-  $spark_master_port                 = extlookup("spark_master_port", "7077")
+-  $spark_master_ui_port              = extlookup("spark_master_ui_port", "18080")
+-
+-  # Lookup comma separated components (i.e. hadoop,spark,hbase ).
+-  $components_tmp                        = extlookup("components",    split($components, ","))
++class hadoop_cluster_node (
++  $hadoop_security_authentication = hiera("hadoop::hadoop_security_authentication", "simple"),
++
++  # Lookup component array or comma separated components (i.e.
++  # hadoop,spark,hbase ) as a default via facter.
++  $cluster_components = "$::components"
++  ) {
+   # Ensure (even if a single value) that the type is an array.
+-  if is_array($components_tmp) {
+-    $components = $components_tmp
+-  }
+-  else {
+-    $components = any2array($components_tmp,",")
++  if is_array($cluster_components) {
++    $components = $cluster_components
++  } else {
++    $components = any2array($cluster_components, ",")
+   }
+ 
+   $all = ($components[0] == undef)
+ 
+-  $hadoop_ha_zookeeper_quorum        = "${hadoop_head_node}:${hadoop_zookeeper_port}"
+-  $solrcloud_zk                      = "${hadoop_head_node}:${hadoop_zookeeper_port}"
+-  $hbase_thrift_address              = "${hadoop_head_node}:${hbase_thrift_port}"
+-  $hadoop_oozie_url                  = "http://${hadoop_head_node}:${hadoop_oozie_port}/oozie"
+-  $hadoop_httpfs_url                 = "http://${hadoop_head_node}:${hadoop_httpfs_port}/webhdfs/v1"
+-  $sqoop_server_url                  = "http://${hadoop_head_node}:${sqoop_server_port}/sqoop"
+-  $solrcloud_url                     = "http://${hadoop_head_node}:${solrcloud_port}/solr/"
+-  $hadoop_rm_url                     = "http://${hadoop_head_node}:${hadoop_rm_http_port}"
+-  $hadoop_rm_proxy_url               = "http://${hadoop_head_node}:${hadoop_rm_proxy_port}"
+-  $hadoop_history_server_url         = "http://${hadoop_head_node}:${hadoop_history_server_port}"
+-
+-  $bigtop_real_users = [ 'jenkins', 'testuser', 'hudson' ]
+-
+-  $hadoop_core_proxyusers = { oozie => { groups => 'hudson,testuser,root,hadoop,jenkins,oozie,httpfs,hue,users', hosts => "*" },
+-                                hue => { groups => 'hudson,testuser,root,hadoop,jenkins,oozie,httpfs,hue,users', hosts => "*" },
+-                             httpfs => { groups => 'hudson,testuser,root,hadoop,jenkins,oozie,httpfs,hue,users', hosts => "*" } }
+-
+-  $hbase_relative_rootdir        = extlookup("hadoop_hbase_rootdir", "/hbase")
+-  $hadoop_hbase_rootdir = "$hadoop_namenode_uri$hbase_relative_rootdir"
+-  $hadoop_hbase_zookeeper_quorum = $hadoop_head_node
+-  $hbase_heap_size               = extlookup("hbase_heap_size", "1024")
+-  $hbase_thrift_server           = $hadoop_head_node
+-
+-  $giraph_zookeeper_quorum       = $hadoop_head_node
+-
+-  $spark_master_host             = $hadoop_head_node
+-  $tachyon_master_host            = $hadoop_head_node
+-
+-  $hadoop_zookeeper_ensemble = ["$hadoop_head_node:2888:3888"]
+-
+-  # Set from facter if available
+-  $roots              = extlookup("hadoop_storage_dirs",       split($hadoop_storage_dirs, ";"))
+-  $namenode_data_dirs = extlookup("hadoop_namenode_data_dirs", append_each("/namenode", $roots))
+-  $hdfs_data_dirs     = extlookup("hadoop_hdfs_data_dirs",     append_each("/hdfs",     $roots))
+-  $mapred_data_dirs   = extlookup("hadoop_mapred_data_dirs",   append_each("/mapred",   $roots))
+-  $yarn_data_dirs     = extlookup("hadoop_yarn_data_dirs",     append_each("/yarn",     $roots))
+-
+-  $hadoop_security_authentication = extlookup("hadoop_security", "simple")
+   if ($hadoop_security_authentication == "kerberos") {
+-    $kerberos_domain     = extlookup("hadoop_kerberos_domain")
+-    $kerberos_realm      = extlookup("hadoop_kerberos_realm")
+-    $kerberos_kdc_server = extlookup("hadoop_kerberos_kdc_server")
+-
+     include kerberos::client
+   }
+ 
+   # Flume agent is the only component that goes on EVERY node in the cluster
+   if ($all or "flume" in $components) {
+-    hadoop-flume::agent { "flume agent":
+-    }
++    include hadoop-flume::agent
+   }
+ }
+ 
+ 
+ 
+-class hadoop_worker_node inherits hadoop_cluster_node {
++class hadoop_worker_node (
++  $bigtop_real_users = [ 'jenkins', 'testuser', 'hudson' ]
++  ) inherits hadoop_cluster_node {
+   user { $bigtop_real_users:
+     ensure     => present,
+     system     => false,
+@@ -150,80 +56,42 @@ class hadoop_worker_node inherits hadoop_cluster_node {
+     User<||> -> Kerberos::Host_keytab<||>
+   }
+ 
+-  hadoop::datanode { "datanode":
+-        namenode_host => $hadoop_namenode_host,
+-        namenode_port => $hadoop_namenode_port,
+-        dirs => $hdfs_data_dirs,
+-        auth => $hadoop_security_authentication,
+-        ha   => $hadoop_ha,
+-  }
+-
++  include hadoop::datanode
+   if ($all or "yarn" in $components) {
+-    hadoop::nodemanager { "nodemanager":
+-          rm_host => $hadoop_rm_host,
+-          rm_port => $hadoop_rm_port,
+-          rt_port => $hadoop_rt_port,
+-          dirs => $yarn_data_dirs,
+-          auth => $hadoop_security_authentication,
+-    }
++    include hadoop::nodemanager
+   }
+   if ($all or "hbase" in $components) {
+-    hadoop-hbase::server { "hbase region server":
+-          rootdir => $hadoop_hbase_rootdir,
+-          heap_size => $hbase_heap_size,
+-          zookeeper_quorum => $hadoop_hbase_zookeeper_quorum,
+-          kerberos_realm => $kerberos_realm,
+-    }
++    include hadoop-hbase::server
+   }
+ 
+   ### If mapred is not installed, yarn can fail.
+   ### So, when we install yarn, we also need mapred for now.
+   ### This dependency should be cleaned up eventually.
+   if ($all or "mapred-app" or "yarn" in $components) {
+-    hadoop::mapred-app { "mapred-app":
+-          namenode_host => $hadoop_namenode_host,
+-          namenode_port => $hadoop_namenode_port,
+-          jobtracker_host => $hadoop_jobtracker_host,
+-          jobtracker_port => $hadoop_jobtracker_port,
+-          auth => $hadoop_security_authentication,
+-          dirs => $mapred_data_dirs,
+-    }
++    include hadoop::mapred-app
+   }
+ 
+   if ($all or "solrcloud" in $components) {
+-    solr::server { "solrcloud server":
+-         port        => $solrcloud_port,
+-         port_admin  => $solrcloud_admin_port,
+-         zk          => $solrcloud_zk,
+-         root_url    => $hadoop_namenode_uri,
+-         kerberos_realm => $kerberos_realm,
+-    }
++    include solr::server
+   }
+ 
+   if ($all or "spark" in $components) {
+-    spark::worker { "spark worker":
+-         master_host    => $spark_master_host,
+-         master_port    => $spark_master_port,
+-         master_ui_port => $spark_master_ui_port,
+-    }
++    include spark::worker
+   }
+ 
+-  if ($components[0] == undef or "tachyon" in $components) {
+-    tachyon::worker { "tachyon worker":
+-         master_host => $tachyon_master_host
+-    }
++  if ($all or "tachyon" in $components) {
++    include tachyon::worker
+   }
+ 
+ }
+ 
+ class hadoop_head_node inherits hadoop_worker_node {
+-
+   exec { "init hdfs":
+     path    => ['/bin','/sbin','/usr/bin','/usr/sbin'],
+     command => 'bash -x /usr/lib/hadoop/libexec/init-hdfs.sh',
+     require => Package['hadoop-hdfs']
+   }
+-  Hadoop::Namenode<||> -> Hadoop::Datanode<||> -> Exec<| title == "init hdfs" |>
++  Class['Hadoop::Namenode'] -> Class['Hadoop::Datanode'] -> Exec<| title == "init hdfs" |>
+ 
+ if ($hadoop_security_authentication == "kerberos") {
+     include kerberos::server
+@@ -231,196 +99,104 @@ if ($hadoop_security_authentication == "kerberos") {
+     include kerberos::kdc::admin_server
+   }
+ 
+-  hadoop::namenode { "namenode":
+-        host => $hadoop_namenode_host,
+-        port => $hadoop_namenode_port,
+-        dirs => $namenode_data_dirs,
+-        auth => $hadoop_security_authentication,
+-        ha   => $hadoop_ha,
+-        zk   => $hadoop_ha_zookeeper_quorum,
+-  }
++  include hadoop::namenode
+ 
+-  if ($hadoop_ha == "disabled") {
+-    hadoop::secondarynamenode { "secondary namenode":
+-          namenode_host => $hadoop_namenode_host,
+-          namenode_port => $hadoop_namenode_port,
+-          auth => $hadoop_security_authentication,
+-    }
++  if ($hadoop::common_hdfs::ha == "disabled") {
++    include hadoop::secondarynamenode
+   }
+ 
+   if ($all or "yarn" in $components) {
+-    hadoop::resourcemanager { "resourcemanager":
+-          host => $hadoop_rm_host,
+-          port => $hadoop_rm_port,
+-          rt_port => $hadoop_rt_port,
+-          sc_port => $hadoop_sc_port,
+-          auth => $hadoop_security_authentication,
+-    }
+-
+-    hadoop::historyserver { "historyserver":
+-          host => $hadoop_hs_host,
+-          port => $hadoop_hs_port,
+-          webapp_port => $hadoop_hs_webapp_port,
+-          auth => $hadoop_security_authentication,
+-    }
+-
+-    hadoop::proxyserver { "proxyserver":
+-          host => $hadoop_ps_host,
+-          port => $hadoop_ps_port,
+-          auth => $hadoop_security_authentication,
+-    }
+-    Exec<| title == "init hdfs" |> -> Hadoop::Resourcemanager<||> -> Hadoop::Nodemanager<||>
+-    Exec<| title == "init hdfs" |> -> Hadoop::Historyserver<||>
++    include hadoop::resourcemanager
++    include hadoop::historyserver
++    include hadoop::proxyserver
++    Exec<| title == "init hdfs" |> -> Class['Hadoop::Resourcemanager'] -> Class['Hadoop::Nodemanager']
++    Exec<| title == "init hdfs" |> -> Class['Hadoop::Historyserver']
+   }
+ 
+   if ($all or "hbase" in $components) {
+-    hadoop-hbase::master { "hbase master":
+-          rootdir => $hadoop_hbase_rootdir,
+-          heap_size => $hbase_heap_size,
+-          zookeeper_quorum => $hadoop_hbase_zookeeper_quorum,
+-          kerberos_realm => $kerberos_realm,
+-    }
+-    Exec<| title == "init hdfs" |> -> Hadoop-hbase::Master<||>
++    include hadoop-hbase::master
++    Exec<| title == "init hdfs" |> -> Class['Hadoop-hbase::Master']
+   }
+ 
+   if ($all or "oozie" in $components) {
+-    hadoop-oozie::server { "oozie server":
+-          kerberos_realm => $kerberos_realm,
++    include hadoop-oozie::server
++    if ($all or "mapred-app" in $components) {
++      Class['Hadoop::Mapred-app'] -> Class['Hadoop-oozie::Server']
+     }
+-    Hadoop::Mapred-app<||> -> Hadoop-oozie::Server<||>
+-    Exec<| title == "init hdfs" |> -> Hadoop-oozie::Server<||>
++    Exec<| title == "init hdfs" |> -> Class['Hadoop-oozie::Server']
+   }
+ 
+   if ($all or "hcat" in $components) {
+-  hcatalog::server { "hcatalog server":
+-        kerberos_realm => $kerberos_realm,
+-  }
+-  hcatalog::webhcat::server { "webhcat server":
+-        kerberos_realm => $kerberos_realm,
+-  }
++    include hcatalog::server
++    include hcatalog::webhcat::server
+   }
+ 
+   if ($all or "spark" in $components) {
+-  spark::master { "spark master":
+-       master_host    => $spark_master_host,
+-       master_port    => $spark_master_port,
+-       master_ui_port => $spark_master_ui_port,
+-  }
++    include spark::master
+   }
+ 
+-  if ($all == undef or "tachyon" in $components) {
+-   tachyon::master { "tachyon-master":
+-       master_host => $tachyon_master_host
+-   }
++  if ($all or "tachyon" in $components) {
++   include tachyon::master
+   }
+ 
+   if ($all or "hbase" in $components) {
+-    hadoop-zookeeper::server { "zookeeper":
+-          myid => "0",
+-          ensemble => $hadoop_zookeeper_ensemble,
+-          kerberos_realm => $kerberos_realm,
+-    }
++    include hadoop-zookeeper::server
+   }
+ 
+-  Exec<| title == "init hdfs" |> -> Hadoop::Rsync_hdfs<||>
+-
++  # class hadoop::rsync_hdfs isn't used anywhere
++  #Exec<| title == "init hdfs" |> -> Class['Hadoop::Rsync_hdfs']
+ }
+ 
+ class standby_head_node inherits hadoop_cluster_node {
+-  hadoop::namenode { "namenode":
+-        host => $hadoop_namenode_host,
+-        port => $hadoop_namenode_port,
+-        dirs => $namenode_data_dirs,
+-        auth => $hadoop_security_authentication,
+-        ha   => $hadoop_ha,
+-        zk   => $hadoop_ha_zookeeper_quorum,
+-  }
++  include hadoop::namenode
+ }
+ 
+ class hadoop_gateway_node inherits hadoop_cluster_node {
+-  $hbase_thrift_address              = "${fqdn}:${hbase_thrift_port}"
+-  $hadoop_httpfs_url                 = "http://${fqdn}:${hadoop_httpfs_port}/webhdfs/v1"
+-  $sqoop_server_url                  = "http://${fqdn}:${sqoop_server_port}/sqoop"
+-  $solrcloud_url                     = "http://${fqdn}:${solrcloud_port}/solr/"
+-
+   if ($all or "sqoop" in $components) {
+-    hadoop-sqoop::server { "sqoop server":
+-    }
++    include hadoop-sqoop::server
+   }
+ 
+   if ($all or "httpfs" in $components) {
+-    hadoop::httpfs { "httpfs":
+-          namenode_host => $hadoop_namenode_host,
+-          namenode_port => $hadoop_namenode_port,
+-          auth => $hadoop_security_authentication,
++    include hadoop::httpfs
++    if ($all or "hue" in $components) {
++      Class['Hadoop::Httpfs'] -> Class['Hue::Server']
+     }
+-    Hadoop::Httpfs<||> -> Hue::Server<||>
+   }
+ 
+   if ($all or "hue" in $components) {
+-    hue::server { "hue server":
+-          rm_url      => $hadoop_rm_url,
+-          rm_proxy_url => $hadoop_rm_proxy_url,
+-          history_server_url => $hadoop_history_server_url,
+-          webhdfs_url => $hadoop_httpfs_url,
+-          sqoop_url   => $sqoop_server_url,
+-          solr_url    => $solrcloud_url,
+-          hbase_thrift_url => $hbase_thrift_address,
+-          rm_host     => $hadoop_rm_host,
+-          rm_port     => $hadoop_rm_port,
+-          oozie_url   => $hadoop_oozie_url,
+-          default_fs  => $hadoop_namenode_uri,
+-          kerberos_realm => $kerberos_realm,
++    include hue::server
++    if ($all or "hbase" in $components) {
++      Class['Hadoop-hbase::Client'] -> Class['Hue::Server']
+     }
+   }
+-  Hadoop-hbase::Client<||> -> Hue::Server<||>
+ 
+-  hadoop::client { "hadoop client":
+-    namenode_host => $hadoop_namenode_host,
+-    namenode_port => $hadoop_namenode_port,
+-    jobtracker_host => $hadoop_jobtracker_host,
+-    jobtracker_port => $hadoop_jobtracker_port,
+-    # auth => $hadoop_security_authentication,
+-  }
++  include hadoop::client
+ 
+   if ($all or "mahout" in $components) {
+-    mahout::client { "mahout client":
+-    }
++    include mahout::client
+   }
+   if ($all or "giraph" in $components) {
+-    giraph::client { "giraph client":
+-       zookeeper_quorum => $giraph_zookeeper_quorum,
+-    }
++    include giraph::client
+   }
+   if ($all or "crunch" in $components) {
+-    crunch::client { "crunch client":
+-    }
++    include crunch::client
+   }
+   if ($all or "pig" in $components) {
+-    hadoop-pig::client { "pig client":
+-    }
++    include hadoop-pig::client
+   }
+   if ($all or "hive" in $components) {
+-    hadoop-hive::client { "hive client":
+-       hbase_zookeeper_quorum => $hadoop_hbase_zookeeper_quorum,
+-    }
++    include hadoop-hive::client
+   }
+   if ($all or "sqoop" in $components) {
+-    hadoop-sqoop::client { "sqoop client":
+-    }
++    include hadoop-sqoop::client
+   }
+   if ($all or "oozie" in $components) {
+-    hadoop-oozie::client { "oozie client":
+-    }
++    include hadoop-oozie::client
+   }
+   if ($all or "hbase" in $components) {
+-    hadoop-hbase::client { "hbase thrift client":
+-      thrift => true,
+-      kerberos_realm => $kerberos_realm,
+-    }
++    include hadoop-hbase::client
+   }
+   if ($all or "zookeeper" in $components) {
+-    hadoop-zookeeper::client { "zookeeper client":
+-    }
++    include hadoop-zookeeper::client
+   }
+ }
+diff --git a/bigtop-deploy/puppet/manifests/site.pp b/bigtop-deploy/puppet/manifests/site.pp
+index 8997140..dd5921c 100644
+--- a/bigtop-deploy/puppet/manifests/site.pp
++++ b/bigtop-deploy/puppet/manifests/site.pp
+@@ -13,19 +13,15 @@
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
+ 
+-require bigtop_util
+-$puppet_confdir = get_setting("confdir")
+ $default_yumrepo = "http://bigtop01.cloudera.org:8080/view/Releases/job/Bigtop-0.8.0/label=centos6/6/artifact/output/"
+-$extlookup_datadir="$puppet_confdir/config"
+-$extlookup_precedence = ["site", "default"]
+-$jdk_package_name = extlookup("jdk_package_name", "jdk")
++$jdk_package_name = hiera("bigtop::jdk_package_name", "jdk")
+ 
+ stage {"pre": before => Stage["main"]}
+ 
+ case $operatingsystem {
+     /(OracleLinux|Amazon|CentOS|Fedora|RedHat)/: {
+        yumrepo { "Bigtop":
+-          baseurl => extlookup("bigtop_yumrepo_uri", $default_yumrepo),
++          baseurl => hiera("hiera::bigtop_yumrepo_uri", $default_yumrepo),
+           descr => "Bigtop packages",
+           enabled => 1,
+           gpgcheck => 0,
+@@ -44,10 +40,16 @@ package { $jdk_package_name:
+ import "cluster.pp"
+ 
+ node default {
+-  include stdlib
+-  $hadoop_head_node = extlookup("hadoop_head_node") 
+-  $standby_head_node = extlookup("standby_head_node", "")
+-  $hadoop_gateway_node = extlookup("hadoop_gateway_node", $hadoop_head_node)
++  $hadoop_head_node = hiera("bigtop::hadoop_head_node")
++  $standby_head_node = hiera("bigtop::standby_head_node", "")
++  $hadoop_gateway_node = hiera("bigtop::hadoop_gateway_node", $hadoop_head_node)
++
++  # look into alternate hiera datasources configured using this path in
++  # hiera.yaml
++  $hadoop_hiera_ha_path = $standby_head_node ? {
++    ""      => "noha",
++    default => "ha",
++  }
+ 
+   case $::fqdn {
+     $hadoop_head_node: {
+@@ -69,7 +71,7 @@ node default {
+ Yumrepo<||> -> Package<||>
+ 
+ if versioncmp($::puppetversion,'3.6.1') >= 0 {
+-  $allow_virtual_packages = hiera('allow_virtual_packages',false)
++  $allow_virtual_packages = hiera('bigtop::allow_virtual_packages',false)
+   Package {
+     allow_virtual => $allow_virtual_packages,
+   }
+diff --git a/bigtop-deploy/puppet/modules/bigtop_util/lib/puppet/parser/functions/append_each.rb b/bigtop-deploy/puppet/modules/bigtop_util/lib/puppet/parser/functions/append_each.rb
+deleted file mode 100644
+index b360b1e..0000000
+--- a/bigtop-deploy/puppet/modules/bigtop_util/lib/puppet/parser/functions/append_each.rb
++++ /dev/null
+@@ -1,22 +0,0 @@
+-# Licensed to the Apache Software Foundation (ASF) under one or more
+-# contributor license agreements. See the NOTICE file distributed with
+-# this work for additional information regarding copyright ownership.
+-# The ASF licenses this file to You under the Apache License, Version 2.0
+-# (the "License"); you may not use this file except in compliance with
+-# the License. You may obtain a copy of the License at
+-#
+-# http://www.apache.org/licenses/LICENSE-2.0
+-#
+-# Unless required by applicable law or agreed to in writing, software
+-# distributed under the License is distributed on an "AS IS" BASIS,
+-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+-# See the License for the specific language governing permissions and
+-# limitations under the License.
+-     
+-# Append a string to every element of an array
+-
+-Puppet::Parser::Functions::newfunction(:append_each, :type => :rvalue) do |args|
+-  suffix = (args[0].is_a? Array) ? args[0].join("") : args[0]
+-  inputs = (args[1].is_a? Array) ? args[1] : [ args[1] ]
+-  inputs.map { |item| item + suffix }
+-end
+diff --git a/bigtop-deploy/puppet/modules/bigtop_util/lib/puppet/parser/functions/get_setting.rb b/bigtop-deploy/puppet/modules/bigtop_util/lib/puppet/parser/functions/get_setting.rb
+deleted file mode 100644
+index 5dc1421..0000000
+--- a/bigtop-deploy/puppet/modules/bigtop_util/lib/puppet/parser/functions/get_setting.rb
++++ /dev/null
+@@ -1,20 +0,0 @@
+-# Licensed to the Apache Software Foundation (ASF) under one or more
+-# contributor license agreements. See the NOTICE file distributed with
+-# this work for additional information regarding copyright ownership.
+-# The ASF licenses this file to You under the Apache License, Version 2.0
+-# (the "License"); you may not use this file except in compliance with
+-# the License. You may obtain a copy of the License at
+-#
+-# http://www.apache.org/licenses/LICENSE-2.0
+-#
+-# Unless required by applicable law or agreed to in writing, software
+-# distributed under the License is distributed on an "AS IS" BASIS,
+-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+-# See the License for the specific language governing permissions and
+-# limitations under the License.
+-
+-# Retrieve a value from Puppet.settings (systemwide puppet configuration)
+-Puppet::Parser::Functions::newfunction(:get_setting, :type => :rvalue) do |args|
+-  ret = Puppet[args[0].to_sym]  
+-  ret.nil? ? :undef : ret
+-end
+diff --git a/bigtop-deploy/puppet/modules/bigtop_util/manifests/init.pp b/bigtop-deploy/puppet/modules/bigtop_util/manifests/init.pp
+deleted file mode 100644
+index 62090b2..0000000
+--- a/bigtop-deploy/puppet/modules/bigtop_util/manifests/init.pp
++++ /dev/null
+@@ -1,17 +0,0 @@
+-# Licensed to the Apache Software Foundation (ASF) under one or more
+-# contributor license agreements. See the NOTICE file distributed with
+-# this work for additional information regarding copyright ownership.
+-# The ASF licenses this file to You under the Apache License, Version 2.0
+-# (the "License"); you may not use this file except in compliance with
+-# the License. You may obtain a copy of the License at
+-#
+-# http://www.apache.org/licenses/LICENSE-2.0
+-#
+-# Unless required by applicable law or agreed to in writing, software
+-# distributed under the License is distributed on an "AS IS" BASIS,
+-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+-# See the License for the specific language governing permissions and
+-# limitations under the License.
+-
+-class bigtop_util {
+-}
+diff --git a/bigtop-deploy/puppet/modules/crunch/manifests/init.pp b/bigtop-deploy/puppet/modules/crunch/manifests/init.pp
+index d446667..b31edf6 100644
+--- a/bigtop-deploy/puppet/modules/crunch/manifests/init.pp
++++ b/bigtop-deploy/puppet/modules/crunch/manifests/init.pp
+@@ -14,7 +14,7 @@
+ # limitations under the License.
+ 
+ class crunch {
+-  define client {
++  class client {
+     package { ["crunch", "crunch-doc"]:
+       ensure => latest,
+     } 
+diff --git a/bigtop-deploy/puppet/modules/giraph/manifests/init.pp b/bigtop-deploy/puppet/modules/giraph/manifests/init.pp
+index 6652e40..1dc0d9b 100644
+--- a/bigtop-deploy/puppet/modules/giraph/manifests/init.pp
++++ b/bigtop-deploy/puppet/modules/giraph/manifests/init.pp
+@@ -14,7 +14,7 @@
+ # limitations under the License.
+ 
+ class giraph {
+-  define client($zookeeper_quorum = 'localhost') {
++  class client($zookeeper_quorum = 'localhost') {
+     package { "giraph":
+       ensure => latest,
+     } 
+diff --git a/bigtop-deploy/puppet/modules/hadoop-flume/manifests/init.pp b/bigtop-deploy/puppet/modules/hadoop-flume/manifests/init.pp
+index 8e3bf64..daf352a 100644
+--- a/bigtop-deploy/puppet/modules/hadoop-flume/manifests/init.pp
++++ b/bigtop-deploy/puppet/modules/hadoop-flume/manifests/init.pp
+@@ -14,7 +14,7 @@
+ # limitations under the License.
+ 
+ class hadoop-flume {
+-  define agent($sources = [], $sinks = [], $channels = []) {
++  class agent($sources = [], $sinks = [], $channels = []) {
+     package { "flume-agent":
+       ensure => latest,
+     } 
+diff --git a/bigtop-deploy/puppet/modules/hadoop-hbase/manifests/init.pp b/bigtop-deploy/puppet/modules/hadoop-hbase/manifests/init.pp
+index 3bbaa8a..454e978 100644
+--- a/bigtop-deploy/puppet/modules/hadoop-hbase/manifests/init.pp
++++ b/bigtop-deploy/puppet/modules/hadoop-hbase/manifests/init.pp
+@@ -20,7 +20,7 @@ class hadoop-hbase {
+     } 
+   }
+ 
+-  class common-config {
++  class common_config ($rootdir, $zookeeper_quorum, $kerberos_realm = "", $heap_size="1024") {
+     include client-package
+     if ($kerberos_realm) {
+       require kerberos::client
+@@ -45,8 +45,8 @@ class hadoop-hbase {
+     }
+   }
+ 
+-  define client($thrift = false, $kerberos_realm = "") {
+-    include common-config
++  class client($thrift = false) {
++    include common_config
+ 
+     if ($thrift) {
+       package { "hbase-thrift":
+@@ -64,8 +64,8 @@ class hadoop-hbase {
+     }
+   }
+ 
+-  define server($rootdir, $zookeeper_quorum, $kerberos_realm = "", $heap_size="1024") {
+-    include common-config
++  class server {
++    include common_config
+ 
+     package { "hbase-regionserver":
+       ensure => latest,
+@@ -81,8 +81,8 @@ class hadoop-hbase {
+     Kerberos::Host_keytab <| title == "hbase" |> -> Service["hbase-regionserver"]
+   }
+ 
+-  define master($rootdir, $zookeeper_quorum, $kerberos_realm = "", $heap_size="1024") {
+-    include common-config
++  class master {
++    include common_config
+ 
+     package { "hbase-master":
+       ensure => latest,
+diff --git a/bigtop-deploy/puppet/modules/hadoop-hive/manifests/init.pp b/bigtop-deploy/puppet/modules/hadoop-hive/manifests/init.pp
+index 891d4be..f9dede4 100644
+--- a/bigtop-deploy/puppet/modules/hadoop-hive/manifests/init.pp
++++ b/bigtop-deploy/puppet/modules/hadoop-hive/manifests/init.pp
+@@ -14,7 +14,7 @@
+ # limitations under the License.
+ 
+ class hadoop-hive {
+-  define client($hbase_master = "", $hbase_zookeeper_quorum = "") {
++  class client($hbase_master = "", $hbase_zookeeper_quorum = "") {
+     package { "hive":
+       ensure => latest,
+     } 
+diff --git a/bigtop-deploy/puppet/modules/hadoop-oozie/manifests/init.pp b/bigtop-deploy/puppet/modules/hadoop-oozie/manifests/init.pp
+index 46b937b..f1177e9 100644
+--- a/bigtop-deploy/puppet/modules/hadoop-oozie/manifests/init.pp
++++ b/bigtop-deploy/puppet/modules/hadoop-oozie/manifests/init.pp
+@@ -14,13 +14,13 @@
+ # limitations under the License.
+ 
+ class hadoop-oozie {
+-  define client($kerberos_realm = "") {
++  class client {
+     package { "oozie-client":
+       ensure => latest,
+     } 
+   }
+ 
+-  define server($kerberos_realm = "") {
++  class server($kerberos_realm = "") {
+     if ($kerberos_realm) {
+       require kerberos::client
+       kerberos::host_keytab { "oozie":
+diff --git a/bigtop-deploy/puppet/modules/hadoop-pig/manifests/init.pp b/bigtop-deploy/puppet/modules/hadoop-pig/manifests/init.pp
+index f26047b..37bfde0 100644
+--- a/bigtop-deploy/puppet/modules/hadoop-pig/manifests/init.pp
++++ b/bigtop-deploy/puppet/modules/hadoop-pig/manifests/init.pp
+@@ -14,7 +14,7 @@
+ # limitations under the License.
+ 
+ class hadoop-pig {
+-  define client {
++  class client {
+     package { "pig":
+       ensure => latest,
+       require => Package["hadoop"],
+diff --git a/bigtop-deploy/puppet/modules/hadoop-sqoop/manifests/init.pp b/bigtop-deploy/puppet/modules/hadoop-sqoop/manifests/init.pp
+index d1d08db..e0223ba 100644
+--- a/bigtop-deploy/puppet/modules/hadoop-sqoop/manifests/init.pp
++++ b/bigtop-deploy/puppet/modules/hadoop-sqoop/manifests/init.pp
+@@ -14,13 +14,13 @@
+ # limitations under the License.
+ 
+ class hadoop-sqoop {
+-  define client {
++  class client {
+     package { "sqoop-client":
+       ensure => latest,
+     } 
+   }
+ 
+-  define server {
++  class server {
+     package { "sqoop-server":
+       ensure => latest,
+     } 
+diff --git a/bigtop-deploy/puppet/modules/hadoop-zookeeper/manifests/init.pp b/bigtop-deploy/puppet/modules/hadoop-zookeeper/manifests/init.pp
+index 701590e..d8bccfe 100644
+--- a/bigtop-deploy/puppet/modules/hadoop-zookeeper/manifests/init.pp
++++ b/bigtop-deploy/puppet/modules/hadoop-zookeeper/manifests/init.pp
+@@ -14,14 +14,17 @@
+ # limitations under the License.
+ 
+ class hadoop-zookeeper {
+-  define client {
++  class client {
+     package { "zookeeper":
+       ensure => latest,
+       require => Package["jdk"],
+     } 
+   }
+ 
+-  define server($myid, $ensemble = ["localhost:2888:3888"],
++  class server($myid,
++                $port = "2181",
++                $datadir = "/var/lib/zookeeper",
++                $ensemble = ["localhost:2888:3888"],
+                 $kerberos_realm = "") 
+   {
+     package { "zookeeper-server":
+diff --git a/bigtop-deploy/puppet/modules/hadoop-zookeeper/templates/zoo.cfg b/bigtop-deploy/puppet/modules/hadoop-zookeeper/templates/zoo.cfg
+index fa6db1e..426fe2a 100644
+--- a/bigtop-deploy/puppet/modules/hadoop-zookeeper/templates/zoo.cfg
++++ b/bigtop-deploy/puppet/modules/hadoop-zookeeper/templates/zoo.cfg
+@@ -23,9 +23,9 @@ initLimit=10
+ # sending a request and getting an acknowledgement
+ syncLimit=5
+ # the directory where the snapshot is stored.
+-dataDir=/var/lib/zookeeper
++dataDir=<%= @datadir %>
+ # the port at which the clients will connect
+-clientPort=2181
++clientPort=<%= @port %>
+ <% @ensemble.each_with_index do |server,idx| %>
+ server.<%= idx %>=<%= server %>
+ <% end %>
+diff --git a/bigtop-deploy/puppet/modules/hadoop/manifests/init.pp b/bigtop-deploy/puppet/modules/hadoop/manifests/init.pp
+index 32eebe2..a560331 100644
+--- a/bigtop-deploy/puppet/modules/hadoop/manifests/init.pp
++++ b/bigtop-deploy/puppet/modules/hadoop/manifests/init.pp
+@@ -13,7 +13,16 @@
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
+ 
+-class hadoop {
++class hadoop ($hadoop_security_authentication = "simple",
++  $zk = "",
++  # Set from facter if available
++  $hadoop_storage_dirs = split($::hadoop_storage_dirs, ";"),
++  $proxyusers = {
++    oozie => { groups => 'hudson,testuser,root,hadoop,jenkins,oozie,httpfs,hue,users', hosts => "*" },
++                  hue => { groups => 'hudson,testuser,root,hadoop,jenkins,oozie,httpfs,hue,users', hosts => "*" },
++               httpfs => { groups => 'hudson,testuser,root,hadoop,jenkins,oozie,httpfs,hue,users', hosts => "*" } } ) {
++
++  include stdlib
+ 
+   /**
+    * Common definitions for hadoop nodes.
+@@ -36,8 +45,28 @@ class hadoop {
+     }
+   }
+ 
+-  class common {
+-    if ($auth == "kerberos") {
++  class common ($hadoop_java_home = undef,
++      $hadoop_classpath = undef,
++      $hadoop_heapsize = undef,
++      $hadoop_opts = undef,
++      $hadoop_namenode_opts = undef,
++      $hadoop_secondarynamenode_opts = undef,
++      $hadoop_datanode_opts = undef,
++      $hadoop_balancer_opts = undef,
++      $hadoop_jobtracker_opts = undef,
++      $hadoop_tasktracker_opts = undef,
++      $hadoop_client_opts = undef,
++      $hadoop_ssh_opts = undef,
++      $hadoop_log_dir = undef,
++      $hadoop_slaves = undef,
++      $hadoop_master = undef,
++      $hadoop_slave_sleep = undef,
++      $hadoop_pid_dir = undef,
++      $hadoop_ident_string = undef,
++      $hadoop_niceness = undef,
++      $hadoop_security_authentication = $hadoop::hadoop_security_authentication ) inherits hadoop {
++
++    if ($hadoop_security_authentication == "kerberos") {
+       include hadoop::kerberos
+     }
+ 
+@@ -58,7 +87,27 @@ class hadoop {
+     #}
+   }
+ 
+-  class common-yarn inherits common {
++  class common_yarn (
++      $yarn_data_dirs = suffix($hadoop::hadoop_storage_dirs, "/yarn"),
++      $kerberos_realm = undef,
++      $hadoop_ps_host,
++      $hadoop_ps_port = "20888",
++      $hadoop_rm_host,
++      $hadoop_rm_port = "8032",
++      $hadoop_rm_admin_port = "8033",
++      $hadoop_rm_webapp_port = "8088",
++      $hadoop_rt_port = "8025",
++      $hadoop_sc_port = "8030",
++      $yarn_nodemanager_resource_memory_mb = undef,
++      $yarn_scheduler_maximum_allocation_mb = undef,
++      $yarn_scheduler_minimum_allocation_mb = undef,
++      $yarn_resourcemanager_scheduler_class = undef,
++      $yarn_resourcemanager_ha_enabled = undef,
++      $yarn_resourcemanager_cluster_id = "ha-rm-uri",
++      $yarn_resourcemanager_zk_address = $hadoop::zk) inherits hadoop {
++
++    include common
++
+     package { "hadoop-yarn":
+       ensure => latest,
+       require => [Package["jdk"], Package["hadoop"]],
+@@ -76,18 +125,56 @@ class hadoop {
+     }
+   }
+ 
+-  class common-hdfs inherits common {
++  class common_hdfs ($ha = "disabled",
++      $hadoop_config_dfs_block_size = undef,
++      $hadoop_config_namenode_handler_count = undef,
++      $hadoop_dfs_datanode_plugins = "",
++      $hadoop_dfs_namenode_plugins = "",
++      $hadoop_namenode_host = $fqdn,
++      $hadoop_namenode_port = "8020",
++      $hadoop_namenode_http_port = "50070",
++      $hadoop_namenode_https_port = "50470",
++      $hdfs_data_dirs = suffix($hadoop::hadoop_storage_dirs, "/hdfs"),
++      $hdfs_shortcut_reader_user = undef,
++      $hdfs_support_append = undef,
++      $hdfs_webhdfs_enabled = "true",
++      $hdfs_replication = undef,
++      $hdfs_datanode_fsdataset_volume_choosing_policy = undef,
++      $namenode_data_dirs = suffix($hadoop::hadoop_storage_dirs, "/namenode"),
++      $nameservice_id = "ha-nn-uri",
++      $journalnode_host = "0.0.0.0",
++      $journalnode_port = "8485",
++      $journalnode_http_port = "8480",
++      $journalnode_https_port = "8481",
++      $journalnode_edits_dir = "${hadoop::hadoop_storage_dirs[0]}/journalnode",
++      $shared_edits_dir = "/hdfs_shared",
++      $testonly_hdfs_sshkeys  = "no",
++      $hadoop_ha_sshfence_user_home = "/var/lib/hadoop-hdfs",
++      $sshfence_user = "hdfs",
++      $zk = $hadoop::zk,
++      $hadoop_config_fs_inmemory_size_mb = undef,
++      $hadoop_security_group_mapping = undef,
++      $hadoop_core_proxyusers = $hadoop::proxyusers,
++      $hadoop_snappy_codec = undef,
++      $hadoop_security_authentication = $hadoop::hadoop_security_authentication ) inherits hadoop {
++
++    $sshfence_keydir  = "$hadoop_ha_sshfence_user_home/.ssh"
++    $sshfence_keypath = "$sshfence_keydir/id_sshfence"
++    $sshfence_privkey = hiera("hadoop::common_hdfs::sshfence_privkey", "hadoop/id_sshfence")
++    $sshfence_pubkey  = hiera("hadoop::common_hdfs::sshfence_pubkey", "hadoop/id_sshfence.pub")
++
++    include common
++
+   # Check if test mode is enforced, so we can install hdfs ssh-keys for passwordless
+-    $testonly   = extlookup("testonly_hdfs_sshkeys", 'no')
+-    if ($testonly == "yes") {
++    if ($testonly_hdfs_sshkeys == "yes") {
+       notify{"WARNING: provided hdfs ssh keys are for testing purposes only.\n
+         They shouldn't be used in production cluster": }
+       $ssh_user        = "hdfs"
+       $ssh_user_home   = "/var/lib/hadoop-hdfs"
+       $ssh_user_keydir = "$ssh_user_home/.ssh"
+       $ssh_keypath     = "$ssh_user_keydir/id_hdfsuser"
+-      $ssh_privkey     = "$extlookup_datadir/hdfs/id_hdfsuser"
+-      $ssh_pubkey      = "$extlookup_datadir/hdfs/id_hdfsuser.pub"
++      $ssh_privkey     = "hdfs/id_hdfsuser"
++      $ssh_pubkey      = "hdfs/id_hdfsuser.pub"
+ 
+       file { $ssh_user_keydir:
+         ensure  => directory,
+@@ -98,7 +185,7 @@ class hadoop {
+       }
+ 
+       file { $ssh_keypath:
+-        source  => $ssh_privkey,
++        source  => "puppet:///files/$ssh_privkey",
+         owner   => 'hdfs',
+         group   => 'hdfs',
+         mode    => '0600',
+@@ -106,21 +193,17 @@ class hadoop {
+       }
+ 
+       file { "$ssh_user_keydir/authorized_keys":
+-        source  => $ssh_pubkey,
++        source  => "puppet:///files/$ssh_pubkey",
+         owner   => 'hdfs',
+         group   => 'hdfs',
+         mode    => '0600',
+         require => File[$ssh_user_keydir],
+       }
+     }
+-    if ($auth == "kerberos" and $ha != "disabled") {
++    if ($hadoop_security_authentication == "kerberos" and $ha != "disabled") {
+       fail("High-availability secure clusters are not currently supported")
+     }
+ 
+-    if ($ha != 'disabled') {
+-      $nameservice_id = extlookup("hadoop_ha_nameservice_id", "ha-nn-uri")
+-    }
+-
+     package { "hadoop-hdfs":
+       ensure => latest,
+       require => [Package["jdk"], Package["hadoop"]],
+@@ -139,7 +222,32 @@ class hadoop {
+     }
+   }
+ 
+-  class common-mapred-app inherits common-hdfs {
++  class common_mapred_app (
++      $hadoop_config_io_sort_factor = undef,
++      $hadoop_config_io_sort_mb = undef,
++      $hadoop_config_mapred_child_ulimit = undef,
++      $hadoop_config_mapred_fairscheduler_assignmultiple = undef,
++      $hadoop_config_mapred_fairscheduler_sizebasedweight = undef,
++      $hadoop_config_mapred_job_tracker_handler_count = undef,
++      $hadoop_config_mapred_reduce_parallel_copies = undef,
++      $hadoop_config_mapred_reduce_slowstart_completed_maps = undef,
++      $hadoop_config_mapred_reduce_tasks_speculative_execution = undef,
++      $hadoop_config_tasktracker_http_threads = undef,
++      $hadoop_config_use_compression = undef,
++      $hadoop_hs_host = undef,
++      $hadoop_hs_port = "10020",
++      $hadoop_hs_webapp_port = "19888",
++      $hadoop_jobtracker_fairscheduler_weightadjuster = undef,
++      $hadoop_jobtracker_host,
++      $hadoop_jobtracker_port = "8021",
++      $hadoop_jobtracker_taskscheduler = undef,
++      $hadoop_mapred_jobtracker_plugins = "",
++      $hadoop_mapred_tasktracker_plugins = "",
++      $mapred_acls_enabled = undef,
++      $mapred_data_dirs = suffix($hadoop::hadoop_storage_dirs, "/mapred")) {
++
++    include common_hdfs
++
+     package { "hadoop-mapreduce":
+       ensure => latest,
+       require => [Package["jdk"], Package["hadoop"]],
+@@ -157,22 +265,8 @@ class hadoop {
+     }
+   }
+ 
+-  define datanode ($namenode_host, $namenode_port, $port = "50075", $auth = "simple", $dirs = ["/tmp/data"], $ha = 'disabled') {
+-
+-    $hadoop_namenode_host           = $namenode_host
+-    $hadoop_namenode_port           = $namenode_port
+-    $hadoop_datanode_port           = $port
+-    $hadoop_security_authentication = $auth
+-
+-    if ($ha != 'disabled') {
+-      # Needed by hdfs-site.xml
+-      $sshfence_keydir  = "/usr/lib/hadoop/.ssh"
+-      $sshfence_keypath = "$sshfence_keydir/id_sshfence"
+-      $sshfence_user    = extlookup("hadoop_ha_sshfence_user",    "hdfs") 
+-      $shared_edits_dir = extlookup("hadoop_ha_shared_edits_dir", "/hdfs_shared")
+-    }
+-
+-    include common-hdfs
++  class datanode {
++    include common_hdfs
+ 
+     package { "hadoop-hdfs-datanode":
+       ensure => latest,
+@@ -189,11 +283,11 @@ class hadoop {
+       ensure => running,
+       hasstatus => true,
+       subscribe => [Package["hadoop-hdfs-datanode"], File["/etc/hadoop/conf/core-site.xml"], File["/etc/hadoop/conf/hdfs-site.xml"], File["/etc/hadoop/conf/hadoop-env.sh"]],
+-      require => [ Package["hadoop-hdfs-datanode"], File["/etc/default/hadoop-hdfs-datanode"], File[$dirs] ],
++      require => [ Package["hadoop-hdfs-datanode"], File["/etc/default/hadoop-hdfs-datanode"], File[$hadoop::common_hdfs::hdfs_data_dirs] ],
+     }
+     Kerberos::Host_keytab <| title == "hdfs" |> -> Exec <| tag == "namenode-format" |> -> Service["hadoop-hdfs-datanode"]
+ 
+-    file { $dirs:
++    file { $hadoop::common_hdfs::hdfs_data_dirs:
+       ensure => directory,
+       owner => hdfs,
+       group => hdfs,
+@@ -202,14 +296,12 @@ class hadoop {
+     }
+   }
+ 
+-  define httpfs ($namenode_host, $namenode_port, $port = "14000", $auth = "simple", $secret = "hadoop httpfs secret") {
+-
+-    $hadoop_namenode_host = $namenode_host
+-    $hadoop_namenode_port = $namenode_port
+-    $hadoop_httpfs_port = $port
+-    $hadoop_security_authentication = $auth
++  class httpfs ($hadoop_httpfs_port = "14000",
++      $secret = "hadoop httpfs secret",
++      $hadoop_core_proxyusers = $hadoop::proxyusers,
++      $hadoop_security_authentcation = $hadoop::hadoop_security_authentication ) inherits hadoop {
+ 
+-    if ($auth == "kerberos") {
++    if ($hadoop_security_authentication == "kerberos") {
+       kerberos::host_keytab { "httpfs":
+         spnego => true,
+         require => Package["hadoop-httpfs"],
+@@ -255,11 +347,12 @@ class hadoop {
+     }
+   }
+ 
+-  define create_hdfs_dirs($hdfs_dirs_meta, $auth="simple") {
++  class create_hdfs_dirs($hdfs_dirs_meta,
++      $hadoop_security_authentcation = $hadoop::hadoop_security_authentication ) inherits hadoop {
+     $user = $hdfs_dirs_meta[$title][user]
+     $perm = $hdfs_dirs_meta[$title][perm]
+ 
+-    if ($auth == "kerberos") {
++    if ($hadoop_security_authentication == "kerberos") {
+       require hadoop::kinit
+       Exec["HDFS kinit"] -> Exec["HDFS init $title"]
+     }
+@@ -272,10 +365,11 @@ class hadoop {
+     Exec <| title == "activate nn1" |>  -> Exec["HDFS init $title"]
+   }
+ 
+-  define rsync_hdfs($files, $auth="simple") {
++  class rsync_hdfs($files,
++      $hadoop_security_authentcation = $hadoop::hadoop_security_authentication ) inherits hadoop {
+     $src = $files[$title]
+ 
+-    if ($auth == "kerberos") {
++    if ($hadoop_security_authentication == "kerberos") {
+       require hadoop::kinit
+       Exec["HDFS kinit"] -> Exec["HDFS init $title"]
+     }
+@@ -288,25 +382,11 @@ class hadoop {
+     Exec <| title == "activate nn1" |>  -> Exec["HDFS rsync $title"]
+   }
+ 
+-  define namenode ($host = $fqdn , $port = "8020", $auth = "simple", $dirs = ["/tmp/nn"], $ha = 'disabled', $zk = '') {
+-
+-    $first_namenode = inline_template("<%= Array(@host)[0] %>")
+-    $hadoop_namenode_host = $host
+-    $hadoop_namenode_port = $port
+-    $hadoop_security_authentication = $auth
+-
+-    if ($ha != 'disabled') {
+-      $sshfence_user      = extlookup("hadoop_ha_sshfence_user",      "hdfs") 
+-      $sshfence_user_home = extlookup("hadoop_ha_sshfence_user_home", "/var/lib/hadoop-hdfs")
+-      $sshfence_keydir    = "$sshfence_user_home/.ssh"
+-      $sshfence_keypath   = "$sshfence_keydir/id_sshfence"
+-      $sshfence_privkey   = extlookup("hadoop_ha_sshfence_privkey",   "$extlookup_datadir/hadoop/id_sshfence")
+-      $sshfence_pubkey    = extlookup("hadoop_ha_sshfence_pubkey",    "$extlookup_datadir/hadoop/id_sshfence.pub")
+-      $shared_edits_dir   = extlookup("hadoop_ha_shared_edits_dir",   "/hdfs_shared")
+-      $nfs_server         = extlookup("hadoop_ha_nfs_server",         "")
+-      $nfs_path           = extlookup("hadoop_ha_nfs_path",           "")
+-
+-      file { $sshfence_keydir:
++  class namenode ( $nfs_server = "", $nfs_path = "" ) {
++    include common_hdfs
++
++    if ($hadoop::common_hdfs::ha != 'disabled') {
++      file { $hadoop::common_hdfs::sshfence_keydir:
+         ensure  => directory,
+         owner   => 'hdfs',
+         group   => 'hdfs',
+@@ -314,49 +394,49 @@ class hadoop {
+         require => Package["hadoop-hdfs"],
+       }
+ 
+-      file { $sshfence_keypath:
+-        source  => $sshfence_privkey,
++      file { $hadoop::common_hdfs::sshfence_keypath:
++        source  => "puppet:///files/$hadoop::common_hdfs::sshfence_privkey",
+         owner   => 'hdfs',
+         group   => 'hdfs',
+         mode    => '0600',
+         before  => Service["hadoop-hdfs-namenode"],
+-        require => File[$sshfence_keydir],
++        require => File[$hadoop::common_hdfs::sshfence_keydir],
+       }
+ 
+-      file { "$sshfence_keydir/authorized_keys":
+-        source  => $sshfence_pubkey,
++      file { "$hadoop::common_hdfs::sshfence_keydir/authorized_keys":
++        source  => "puppet:///files/$hadoop::common_hdfs::sshfence_pubkey",
+         owner   => 'hdfs',
+         group   => 'hdfs',
+         mode    => '0600',
+         before  => Service["hadoop-hdfs-namenode"],
+-        require => File[$sshfence_keydir],
+-      }
+-
+-      file { $shared_edits_dir:
+-        ensure => directory,
++        require => File[$hadoop::common_hdfs::sshfence_keydir],
+       }
+ 
+-      if ($nfs_server) {
+-        if (!$nfs_path) {
+-          fail("No nfs share specified for shared edits dir")
++      if (! ('qjournal://' in $hadoop::common_hdfs::shared_edits_dir)) {
++        file { $hadoop::common_hdfs::shared_edits_dir:
++          ensure => directory,
+         }
+ 
+-        require nfs::client
++        if ($nfs_server) {
++          if (!$nfs_path) {
++            fail("No nfs share specified for shared edits dir")
++          }
++
++          require nfs::client
+ 
+-        mount { $shared_edits_dir:
+-          ensure  => "mounted",
+-          atboot  => true,
+-          device  => "${nfs_server}:${nfs_path}",
+-          fstype  => "nfs",
+-          options => "tcp,soft,timeo=10,intr,rsize=32768,wsize=32768",
+-          require => File[$shared_edits_dir],
+-          before  => Service["hadoop-hdfs-namenode"],
++          mount { $hadoop::common_hdfs::shared_edits_dir:
++            ensure  => "mounted",
++            atboot  => true,
++            device  => "${nfs_server}:${nfs_path}",
++            fstype  => "nfs",
++            options => "tcp,soft,timeo=10,intr,rsize=32768,wsize=32768",
++            require => File[$hadoop::common::hdfs::shared_edits_dir],
++            before  => Service["hadoop-hdfs-namenode"],
++          }
+         }
+       }
+     }
+ 
+-    include common-hdfs
+-
+     package { "hadoop-hdfs-namenode":
+       ensure => latest,
+       require => Package["jdk"],
+@@ -370,7 +450,7 @@ class hadoop {
+     } 
+     Kerberos::Host_keytab <| title == "hdfs" |> -> Exec <| tag == "namenode-format" |> -> Service["hadoop-hdfs-namenode"]
+ 
+-    if ($ha == "auto") {
++    if ($hadoop::common_hdfs::ha == "auto") {
+       package { "hadoop-hdfs-zkfc":
+         ensure => latest,
+         require => Package["jdk"],
+@@ -385,17 +465,19 @@ class hadoop {
+       Service <| title == "hadoop-hdfs-zkfc" |> -> Service <| title == "hadoop-hdfs-namenode" |>
+     }
+ 
++    $namenode_array = any2array($hadoop::common_hdfs::hadoop_namenode_host)
++    $first_namenode = $namenode_array[0]
+     if ($::fqdn == $first_namenode) {
+       exec { "namenode format":
+         user => "hdfs",
+         command => "/bin/bash -c 'yes Y | hdfs namenode -format >> /var/lib/hadoop-hdfs/nn.format.log 2>&1'",
+-        creates => "${dirs[0]}/current/VERSION",
+-        require => [ Package["hadoop-hdfs-namenode"], File[$dirs], File["/etc/hadoop/conf/hdfs-site.xml"] ],
++        creates => "${hadoop::common_hdfs::namenode_data_dirs[0]}/current/VERSION",
++        require => [ Package["hadoop-hdfs-namenode"], File[$hadoop::common_hdfs::namenode_data_dirs], File["/etc/hadoop/conf/hdfs-site.xml"] ],
+         tag     => "namenode-format",
+       } 
+ 
+-      if ($ha != "disabled") {
+-        if ($ha == "auto") {
++      if ($hadoop::common_hdfs::ha != "disabled") {
++        if ($hadoop::common_hdfs::ha == "auto") {
+           exec { "namenode zk format":
+             user => "hdfs",
+             command => "/bin/bash -c 'yes N | hdfs zkfc -formatZK >> /var/lib/hadoop-hdfs/zk.format.log 2>&1 || :'",
+@@ -413,11 +495,11 @@ class hadoop {
+           }
+         }
+       }
+-    } elsif ($ha != "disabled") {
+-      hadoop::namedir_copy { $namenode_data_dirs: 
++    } elsif ($hadoop::common_hdfs::ha != "disabled") {
++      hadoop::namedir_copy { $hadoop::common_hdfs::namenode_data_dirs:
+         source       => $first_namenode,
+-        ssh_identity => $sshfence_keypath,
+-        require      => File[$sshfence_keypath],
++        ssh_identity => $hadoop::common_hdfs::sshfence_keypath,
++        require      => File[$hadoop::common_hdfs::sshfence_keypath],
+       }
+     }
+ 
+@@ -427,7 +509,7 @@ class hadoop {
+         require => [Package["hadoop-hdfs-namenode"]],
+     }
+     
+-    file { $dirs:
++    file { $hadoop::common_hdfs::namenode_data_dirs:
+       ensure => directory,
+       owner => hdfs,
+       group => hdfs,
+@@ -445,12 +527,8 @@ class hadoop {
+     }
+   }
+       
+-  define secondarynamenode ($namenode_host, $namenode_port, $port = "50090", $auth = "simple") {
+-
+-    $hadoop_secondarynamenode_port = $port
+-    $hadoop_security_authentication = $auth
+-
+-    include common-hdfs
++  class secondarynamenode {
++    include common_hdfs
+ 
+     package { "hadoop-hdfs-secondarynamenode":
+       ensure => latest,
+@@ -472,15 +550,36 @@ class hadoop {
+     Kerberos::Host_keytab <| title == "hdfs" |> -> Service["hadoop-hdfs-secondarynamenode"]
+   }
+ 
++  class journalnode {
++    include common_hdfs
++
++    package { "hadoop-hdfs-journalnode":
++      ensure => latest,
++      require => Package["jdk"],
++    }
++
++    $journalnode_cluster_journal_dir = "${hadoop::common_hdfs::journalnode_edits_dir}/${hadoop::common_hdfs::nameservice_id}"
++
++    service { "hadoop-hdfs-journalnode":
++      ensure => running,
++      hasstatus => true,
++      subscribe => [Package["hadoop-hdfs-journalnode"], File["/etc/hadoop/conf/hadoop-env.sh"],
++                    File["/etc/hadoop/conf/hdfs-site.xml"], File["/etc/hadoop/conf/core-site.xml"]],
++      require => [ Package["hadoop-hdfs-journalnode"], File[$journalnode_cluster_journal_dir] ],
++    }
++
++    file { [ "${hadoop::common_hdfs::journalnode_edits_dir}", "$journalnode_cluster_journal_dir" ]:
++      ensure => directory,
++      owner => 'hdfs',
++      group => 'hdfs',
++      mode => 755,
++      require => [Package["hadoop-hdfs"]],
++    }
++  }
+ 
+-  define resourcemanager ($host = $fqdn, $port = "8032", $rt_port = "8025", $sc_port = "8030", $auth = "simple") {
+-    $hadoop_rm_host = $host
+-    $hadoop_rm_port = $port
+-    $hadoop_rt_port = $rt_port
+-    $hadoop_sc_port = $sc_port
+-    $hadoop_security_authentication = $auth
+ 
+-    include common-yarn
++  class resourcemanager {
++    include common_yarn
+ 
+     package { "hadoop-yarn-resourcemanager":
+       ensure => latest,
+@@ -497,12 +596,8 @@ class hadoop {
+     Kerberos::Host_keytab <| tag == "mapreduce" |> -> Service["hadoop-yarn-resourcemanager"]
+   }
+ 
+-  define proxyserver ($host = $fqdn, $port = "8088", $auth = "simple") {
+-    $hadoop_ps_host = $host
+-    $hadoop_ps_port = $port
+-    $hadoop_security_authentication = $auth
+-
+-    include common-yarn
++  class proxyserver {
++    include common_yarn
+ 
+     package { "hadoop-yarn-proxyserver":
+       ensure => latest,
+@@ -519,13 +614,8 @@ class hadoop {
+     Kerberos::Host_keytab <| tag == "mapreduce" |> -> Service["hadoop-yarn-proxyserver"]
+   }
+ 
+-  define historyserver ($host = $fqdn, $port = "10020", $webapp_port = "19888", $auth = "simple") {
+-    $hadoop_hs_host = $host
+-    $hadoop_hs_port = $port
+-    $hadoop_hs_webapp_port = $app_port
+-    $hadoop_security_authentication = $auth
+-
+-    include common-mapred-app
++  class historyserver {
++    include common_mapred_app
+ 
+     package { "hadoop-mapreduce-historyserver":
+       ensure => latest,
+@@ -543,12 +633,8 @@ class hadoop {
+   }
+ 
+ 
+-  define nodemanager ($rm_host, $rm_port, $rt_port, $auth = "simple", $dirs = ["/tmp/yarn"]){
+-    $hadoop_rm_host = $rm_host
+-    $hadoop_rm_port = $rm_port
+-    $hadoop_rt_port = $rt_port
+-
+-    include common-yarn
++  class nodemanager {
++    include common_yarn
+ 
+     package { "hadoop-yarn-nodemanager":
+       ensure => latest,
+@@ -560,11 +646,11 @@ class hadoop {
+       hasstatus => true,
+       subscribe => [Package["hadoop-yarn-nodemanager"], File["/etc/hadoop/conf/hadoop-env.sh"], 
+                     File["/etc/hadoop/conf/yarn-site.xml"], File["/etc/hadoop/conf/core-site.xml"]],
+-      require => [ Package["hadoop-yarn-nodemanager"], File[$dirs] ],
++      require => [ Package["hadoop-yarn-nodemanager"], File[$hadoop::common_yarn::yarn_data_dirs] ],
+     }
+     Kerberos::Host_keytab <| tag == "mapreduce" |> -> Service["hadoop-yarn-nodemanager"]
+ 
+-    file { $dirs:
++    file { $hadoop::common_yarn::yarn_data_dirs:
+       ensure => directory,
+       owner => yarn,
+       group => yarn,
+@@ -573,21 +659,10 @@ class hadoop {
+     }
+   }
+ 
+-  define mapred-app ($namenode_host, $namenode_port, $jobtracker_host, $jobtracker_port, $auth = "simple", $jobhistory_host = "", $jobhistory_port="10020", $dirs = ["/tmp/mr"]){
+-    $hadoop_namenode_host = $namenode_host
+-    $hadoop_namenode_port = $namenode_port
+-    $hadoop_jobtracker_host = $jobtracker_host
+-    $hadoop_jobtracker_port = $jobtracker_port
+-    $hadoop_security_authentication = $auth
+-
+-    include common-mapred-app
++  class mapred-app {
++    include common_mapred_app
+ 
+-    if ($jobhistory_host != "") {
+-      $hadoop_hs_host = $jobhistory_host
+-      $hadoop_hs_port = $jobhistory_port
+-    }
+-
+-    file { $dirs:
++    file { $hadoop::common_mapred_app::mapred_data_dirs:
+       ensure => directory,
+       owner => yarn,
+       group => yarn,
+@@ -596,12 +671,9 @@ class hadoop {
+     }
+   }
+ 
+-  define client ($namenode_host, $namenode_port, $jobtracker_host, $jobtracker_port, $auth = "simple") {
+-      $hadoop_namenode_host = $namenode_host
+-      $hadoop_namenode_port = $namenode_port
+-      $hadoop_jobtracker_host = $jobtracker_host
+-      $hadoop_jobtracker_port = $jobtracker_port
+-      $hadoop_security_authentication = $auth
++  class client {
++      include common_mapred_app
++
+       $hadoop_client_packages = $operatingsystem ? {
+         /(OracleLinux|CentOS|RedHat|Fedora)/  => [ "hadoop-doc", "hadoop-hdfs-fuse", "hadoop-client", "hadoop-libhdfs", "hadoop-debuginfo" ],
+         /(SLES|OpenSuSE)/                     => [ "hadoop-doc", "hadoop-hdfs-fuse", "hadoop-client", "hadoop-libhdfs" ],
+@@ -609,8 +681,6 @@ class hadoop {
+         default                               => [ "hadoop-doc", "hadoop-hdfs-fuse", "hadoop-client" ],
+       }
+ 
+-      include common-mapred-app
+-  
+       package { $hadoop_client_packages:
+         ensure => latest,
+         require => [Package["jdk"], Package["hadoop"], Package["hadoop-hdfs"], Package["hadoop-mapreduce"]],  
+diff --git a/bigtop-deploy/puppet/modules/hadoop/templates/hadoop-env.sh b/bigtop-deploy/puppet/modules/hadoop/templates/hadoop-env.sh
+index 6b28bdd..f2e355b 100644
+--- a/bigtop-deploy/puppet/modules/hadoop/templates/hadoop-env.sh
++++ b/bigtop-deploy/puppet/modules/hadoop/templates/hadoop-env.sh
+@@ -15,7 +15,7 @@
+ 
+ <% def shell_config(shell_var, *puppet_var)
+      puppet_var = puppet_var[0] || shell_var.downcase
+-     if has_variable? puppet_var
++     if @puppet_var
+         return "export #{shell_var}=#{scope.lookupvar(puppet_var)}"
+      else
+         return "#export #{shell_var}="
+diff --git a/bigtop-deploy/puppet/modules/hadoop/templates/hdfs-site.xml b/bigtop-deploy/puppet/modules/hadoop/templates/hdfs-site.xml
+index 351508d..339702b 100644
+--- a/bigtop-deploy/puppet/modules/hadoop/templates/hdfs-site.xml
++++ b/bigtop-deploy/puppet/modules/hadoop/templates/hdfs-site.xml
+@@ -30,7 +30,7 @@
+ <%   end -%>
+ 
+   <property> 
+-    <name>dfs.federation.nameservices</name>
++    <name>dfs.nameservices</name>
+     <value><%= @nameservice_id %></value>
+   </property>
+ 
+@@ -47,7 +47,12 @@
+  
+   <property>
+     <name>dfs.namenode.http-address.<%= @nameservice_id %>.nn<%= idx+1 %></name>
+-    <value><%= host %>:50070</value>
++    <value><%= host %>:<%= @hadoop_namenode_http_port %></value>
++  </property>
++
++  <property>
++    <name>dfs.namenode.https-address.<%= @nameservice_id %>.nn<%= idx+1 %></name>
++    <value><%= host %>:<%= @hadoop_namenode_https_port %></value>
+   </property>
+ 
+ <%   end -%>
+@@ -249,7 +254,47 @@
+ <% end -%>
+   <property>
+     <name>dfs.webhdfs.enabled</name>
+-    <value>true</value>
++    <value><%= @hdfs_webhdfs_enabled %></value>
++  </property>
++
++<% if @hdfs_datanode_fsdataset_volume_choosing_policy -%>
++  <property>
++    <name>dfs.datanode.fsdataset.volume.choosing.policy</name>
++    <value><%= @hdfs_datanode_fsdataset_volume_choosing_policy %></value>
+   </property>
+ 
++<% end -%>
++<% if @hdfs_replication -%>
++  <property>
++    <name>dfs.replication</name>
++    <value><%= @hdfs_replication %></value>
++  </property>
++
++<% end -%>
++<% if @shared_edits_dir.start_with?("qjournal://") -%>
++<%   if @journalnode_edits_dir -%>
++  <property>
++    <name>dfs.journalnode.edits.dir</name>
++    <value><%= @journalnode_edits_dir %></value>
++  </property>
++
++<%   end -%>
++<%   if @journalnode_host -%>
++  <property>
++    <name>dfs.journalnode.rpc-address</name>
++    <value><%= @journalnode_host %>:<%= @journalnode_port %></value>
++  </property>
++
++  <property>
++    <name>dfs.journalnode.http-address</name>
++    <value><%= @journalnode_host %>:<%= @journalnode_http_port %></value>
++  </property>
++
++  <property>
++    <name>dfs.journalnode.https-address</name>
++    <value><%= @journalnode_host %>:<%= @journalnode_https_port %></value>
++  </property>
++
++<%   end -%>
++<% end -%>
+ </configuration>
+diff --git a/bigtop-deploy/puppet/modules/hadoop/templates/yarn-site.xml b/bigtop-deploy/puppet/modules/hadoop/templates/yarn-site.xml
+index 0713d97..2c90907 100644
+--- a/bigtop-deploy/puppet/modules/hadoop/templates/yarn-site.xml
++++ b/bigtop-deploy/puppet/modules/hadoop/templates/yarn-site.xml
+@@ -17,6 +17,7 @@
+ -->
+ <?xml-stylesheet type="text/xsl" href="configuration.xsl"?>
+ 
++<% resourcemanager_hosts = Array(@hadoop_rm_host) -%>
+ <configuration>
+ <% if @hadoop_security_authentication == "kerberos" %>
+   <!-- JobTracker security configs -->
+@@ -61,6 +62,57 @@
+     <value><%= @hadoop_ps_host %>:<%= @hadoop_ps_port %></value>
+   </property> 
+ 
++<% if @yarn_resourcemanager_ha_enabled -%>
++
++  <property>
++    <name>yarn.resourcemanager.ha.enabled</name>
++    <value><%= @yarn_resourcemanager_ha_enabled %></value>
++  </property>
++
++  <property>
++    <name>yarn.resourcemanager.cluster-id</name>
++    <value><%= @yarn_resourcemanager_cluster_id %></value>
++  </property>
++
++  <property>
++    <name>yarn.resourcemanager.ha.rm-ids</name>
++    <value><%= (1..resourcemanager_hosts.length).map { |n| "rm#{n}" }.join(",") %></value>
++  </property>
++
++<%   resourcemanager_hosts.each_with_index do |host,idx| -%>
++  <property>
++    <name>yarn.resourcemanager.resource-tracker.address.rm<%= idx+1 %></name>
++    <value><%= host %>:<%= @hadoop_rt_port %></value>
++  </property>
++
++  <property>
++    <name>yarn.resourcemanager.address.rm<%= idx+1 %></name>
++    <value><%= host %>:<%= @hadoop_rm_port %></value>
++  </property>
++
++  <property>
++    <name>yarn.resourcemanager.scheduler.address.rm<%= idx+1 %></name>
++    <value><%= host %>:<%= @hadoop_sc_port %></value>
++  </property>
++
++  <property>
++    <name>yarn.resourcemanager.admin.address.rm<%= idx+1 %></name>
++    <value><%= host %>:<%= @hadoop_rm_admin_port %></value>
++  </property>
++
++  <property>
++    <name>yarn.resourcemanager.webapp.address.rm<%= idx+1 %></name>
++    <value><%= host %>:<%= @hadoop_rm_webapp_port %></value>
++  </property>
++<%   end -%>
++<% if @yarn_resourcemanager_zk_address -%>
++
++  <property>
++    <name>yarn.resourcemanager.zk-address</name>
++    <value><%= @yarn_resourcemanager_zk_address %></value>
++  </property>
++<% end -%>
++<% else -%>
+   <property>
+     <name>yarn.resourcemanager.resource-tracker.address</name>
+     <value><%= @hadoop_rm_host %>:<%= @hadoop_rt_port %></value>
+@@ -75,6 +127,7 @@
+     <name>yarn.resourcemanager.scheduler.address</name>
+     <value><%= @hadoop_rm_host %>:<%= @hadoop_sc_port %></value>
+   </property>
++<% end -%>
+ 
+   <property>
+     <name>yarn.nodemanager.aux-services</name>
+@@ -125,4 +178,32 @@
+         $HADOOP_YARN_HOME/*,$HADOOP_YARN_HOME/lib/*
+      </value>
+   </property>
++<% if @yarn_scheduler_minimum_allocation_mb -%>
++
++  <property>
++    <name>yarn.scheduler.minimum-allocation-mb</name>
++    <value><%= @yarn_scheduler_minimum_allocation_mb %></value>
++  </property>
++<% end -%>
++<% if @yarn_scheduler_maximum_allocation_mb -%>
++
++  <property>
++    <name>yarn.scheduler.maximum-allocation-mb</name>
++    <value><%= @yarn_scheduler_maximum_allocation_mb %></value>
++  </property>
++<% end -%>
++<% if @yarn_nodemanager_resource_memory_mb -%>
++
++  <property>
++    <name>yarn.nodemanager.resource.memory-mb</name>
++    <value><%= @yarn_nodemanager_resource_memory_mb %></value>
++  </property>
++<% end -%>
++<% if @yarn_resourcemanager_scheduler_class -%>
++
++  <property>
++    <name>yarn.resourcemanager.scheduler.class</name>
++    <value><%= @yarn_resourcemanager_scheduler_class %></value>
++  </property>
++<% end -%>
+ </configuration>
+diff --git a/bigtop-deploy/puppet/modules/hcatalog/manifests/init.pp b/bigtop-deploy/puppet/modules/hcatalog/manifests/init.pp
+index f9c07aa..6585dd3 100644
+--- a/bigtop-deploy/puppet/modules/hcatalog/manifests/init.pp
++++ b/bigtop-deploy/puppet/modules/hcatalog/manifests/init.pp
+@@ -14,7 +14,7 @@
+ # limitations under the License.
+ 
+ class hcatalog {
+-  define server($port = "9083", $kerberos_realm = "") {
++  class server($port = "9083", $kerberos_realm = "") {
+     package { "hcatalog-server":
+       ensure => latest,
+     }
+@@ -33,7 +33,7 @@ class hcatalog {
+   }
+ 
+   class webhcat {
+-    define server($port = "50111", $kerberos_realm = "") {
++    class server($port = "50111", $kerberos_realm = "") {
+       package { "webhcat-server":
+         ensure => latest,
+       }
+diff --git a/bigtop-deploy/puppet/modules/hue/manifests/init.pp b/bigtop-deploy/puppet/modules/hue/manifests/init.pp
+index f4c6f95..e5c7762 100644
+--- a/bigtop-deploy/puppet/modules/hue/manifests/init.pp
++++ b/bigtop-deploy/puppet/modules/hue/manifests/init.pp
+@@ -14,7 +14,7 @@
+ # limitations under the License.
+ 
+ class hue {
+-  define server($sqoop_url, $solr_url, $hbase_thrift_url,
++  class server($sqoop_url, $solr_url, $hbase_thrift_url,
+                 $webhdfs_url, $rm_host, $rm_port, $oozie_url, $rm_url, $rm_proxy_url, $history_server_url,
+                 $hue_host = "0.0.0.0", $hue_port = "8888", $default_fs = "hdfs://localhost:8020",
+                 $kerberos_realm = "") {
+diff --git a/bigtop-deploy/puppet/modules/kerberos/manifests/init.pp b/bigtop-deploy/puppet/modules/kerberos/manifests/init.pp
+index 5476235..dd83500 100644
+--- a/bigtop-deploy/puppet/modules/kerberos/manifests/init.pp
++++ b/bigtop-deploy/puppet/modules/kerberos/manifests/init.pp
+@@ -14,23 +14,12 @@
+ # limitations under the License.
+ 
+ class kerberos {
+-  class site {
+-    # The following is our interface to the world. This is what we allow
+-    # users to tweak from the outside (see tests/init.pp for a complete
+-    # example) before instantiating target classes.
+-    # Once we migrate to Puppet 2.6 we can potentially start using 
+-    # parametrized classes instead.
+-    $domain     = $kerberos_domain     ? { '' => inline_template('<%= domain %>'),
+-                                           default => $kerberos_domain }
+-    $realm      = $kerberos_realm      ? { '' => inline_template('<%= domain.upcase %>'),
+-                                           default => $kerberos_realm } 
+-    $kdc_server = $kerberos_kdc_server ? { '' => 'localhost',
+-                                           default => $kerberos_kdc_server }
+-    $kdc_port   = $kerberos_kdc_port   ? { '' => '88', 
+-                                           default => $kerberos_kdc_port } 
+-    $admin_port = 749 /* BUG: linux daemon packaging doesn't let us tweak this */
+-
+-    $keytab_export_dir = "/var/lib/bigtop_keytabs"
++  class site ($domain = inline_template('<%= domain %>'),
++      $realm = inline_template('<%= domain.upcase %>'),
++      $kdc_server = 'localhost',
++      $kdc_port = '88',
++      $admin_port = 749,
++      $keytab_export_dir = "/var/lib/bigtop_keytabs") {
+ 
+     case $operatingsystem {
+         'ubuntu': {
+diff --git a/bigtop-deploy/puppet/modules/mahout/manifests/init.pp b/bigtop-deploy/puppet/modules/mahout/manifests/init.pp
+index 9f10b17..0d9bd8c 100644
+--- a/bigtop-deploy/puppet/modules/mahout/manifests/init.pp
++++ b/bigtop-deploy/puppet/modules/mahout/manifests/init.pp
+@@ -14,7 +14,7 @@
+ # limitations under the License.
+ 
+ class mahout {
+-  define client {
++  class client {
+     package { "mahout":
+       ensure => latest,
+       require => Package["hadoop"],
+diff --git a/bigtop-deploy/puppet/modules/solr/manifests/init.pp b/bigtop-deploy/puppet/modules/solr/manifests/init.pp
+index 22c4d9e..119fbd1 100644
+--- a/bigtop-deploy/puppet/modules/solr/manifests/init.pp
++++ b/bigtop-deploy/puppet/modules/solr/manifests/init.pp
+@@ -14,7 +14,7 @@
+ # limitations under the License.
+ 
+ class solr {
+-  define server($port = "1978", $port_admin = "1979", $zk = "localhost:2181", $root_url = "hdfs://localhost:8020/solr", $kerberos_realm = "") {
++  class server($port = "1978", $port_admin = "1979", $zk = "localhost:2181", $root_url = "hdfs://localhost:8020/solr", $kerberos_realm = "") {
+     package { "solr-server":
+       ensure => latest,
+     }
+diff --git a/bigtop-deploy/puppet/modules/spark/manifests/init.pp b/bigtop-deploy/puppet/modules/spark/manifests/init.pp
+index 1281ff4..d7a9360 100644
+--- a/bigtop-deploy/puppet/modules/spark/manifests/init.pp
++++ b/bigtop-deploy/puppet/modules/spark/manifests/init.pp
+@@ -14,7 +14,7 @@
+ # limitations under the License.
+ 
+ class spark {
+-  class common {
++  class common ($master_host = $fqdn, $master_port = "7077", $master_ui_port = "18080") {
+     package { "spark-core":
+       ensure => latest,
+     }
+@@ -25,7 +25,7 @@ class spark {
+     }
+   }
+ 
+-  define master($master_host = $fqdn, $master_port = "7077", $master_ui_port = "18080") {
++  class master {
+     include common   
+ 
+     package { "spark-master":
+@@ -43,7 +43,7 @@ class spark {
+     }
+   }
+ 
+-  define worker($master_host = $fqdn, $master_port = "7077", $master_ui_port = "18080") {
++  class worker {
+     include common
+ 
+     package { "spark-worker":
+diff --git a/bigtop-deploy/puppet/modules/tachyon/manifests/init.pp b/bigtop-deploy/puppet/modules/tachyon/manifests/init.pp
+index 55fb34a..e9715ae 100644
+--- a/bigtop-deploy/puppet/modules/tachyon/manifests/init.pp
++++ b/bigtop-deploy/puppet/modules/tachyon/manifests/init.pp
+@@ -10,7 +10,7 @@
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
+ class tachyon {
+-  class common {
++  class common ($master_host){
+     package { "tachyon":
+       ensure => latest,
+     }
+@@ -29,7 +29,7 @@ class tachyon {
+     }
+   }
+ 
+-  define master($master_host) {
++  class master {
+     include common
+ 
+    exec {
+@@ -38,7 +38,7 @@ class tachyon {
+            require => [ Package["tachyon"]]
+     }
+ 
+-    if ( $fqdn == $master_host ) {
++    if ( $fqdn == $tachyon::common::master_host ) {
+       service { "tachyon-master":
+         ensure => running,
+         require => [ Package["tachyon"] ],
+@@ -49,10 +49,10 @@ class tachyon {
+ 
+   }
+ 
+-  define worker($master_host) {
++  class worker {
+     include common
+ 
+-   if ( $fqdn == $master_host ) {
++   if ( $fqdn == $tachyon::common::master_host ) {
+       notice("tachyon ---> master host")
+       # We want master to run first in all cases
+       Service["tachyon-master"] ~> Service["tachyon-worker"]
+-- 
+2.1.4
+
